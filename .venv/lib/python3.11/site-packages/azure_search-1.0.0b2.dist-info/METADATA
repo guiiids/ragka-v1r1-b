@@ -1,0 +1,35 @@
+Metadata-Version: 2.1
+Name: azure-search
+Version: 1.0.0b2
+Summary: Microsoft Azure Cognitive Search Client Library for Python
+Home-page: https://github.com/Azure/azure-sdk-for-python/tree/master/sdk/search/azure-search
+Author: Microsoft Corporation
+Author-email: ascl@microsoft.com
+License: MIT License
+Platform: UNKNOWN
+Classifier: Development Status :: 4 - Beta
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 2
+Classifier: Programming Language :: Python :: 2.7
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: License :: OSI Approved :: MIT License
+Description-Content-Type: text/markdown
+Requires-Dist: azure-core (<2.0.0,>=1.2.2)
+Requires-Dist: msrest (>=0.6.10)
+Requires-Dist: futures ; python_version<'3.0'
+Requires-Dist: azure-nspkg ; python_version<'3.0'
+Requires-Dist: enum34 (>=1.0.4) ; python_version<'3.4'
+Requires-Dist: typing ; python_version<'3.5'
+
+# Azure Cognitive Search client library for Python
+
+This package was the Microsoft Azure Cognitive Search client library.
+
+It is deprecated. 
+
+The new package can be found at: https://pypi.org/project/azure-search-documents/.
+
