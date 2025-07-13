@@ -9,6 +9,7 @@ from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 from azure.core.credentials import AzureKeyCredential
 import re
+import uuid
 import sys
 import os
 import json
@@ -317,6 +318,32 @@ def is_procedural_content(text: str) -> bool:
     # Check for numbered steps (e.g., "1. Do this")
     if re.search(r'\d+\.\s+[A-Z]', text):
         return True
+
+    # Check for instructional keywords
+    instructional_keywords = ['follow', 'steps', 'procedure', 'instructions', 'guide']
+    if any(keyword in text.lower() for keyword in instructional_keywords):
+        return True
+
+    return False
+def test_internal_citation_detection():
+    """Test detection of internal citation IDs in answers."""
+    test_logger.info("Running test_internal_citation_detection")
+    assistant = FlaskRAGAssistantWithHistory()
+    # Prepare a fake src_map with internal ID
+    src_map = {
+        "S1_ab12cd34": {
+            "title": "Test",
+            "content": "Test content",
+            "parent_id": "",
+            "is_procedural": False
+        }
+    }
+    answer = "Reference to source [S1_ab12cd34]."
+    cited = assistant._filter_cited(answer, src_map)
+    assert len(cited) == 1, "Should detect the internal citation"
+    assert cited[0]["id"] == "S1_ab12cd34", "Detected ID should match the internal citation"
+    test_logger.info("test_internal_citation_detection passed")
+    return True
     
     # Check for instructional keywords
     instructional_keywords = ['follow', 'steps', 'procedure', 'instructions', 'guide']
@@ -517,6 +544,7 @@ class FlaskRAGAssistantWithHistory:
         self._load_settings()
         
         logger.info("FlaskRAGAssistantWithHistory initialized with conversation history")
+        self._cumulative_src_map = {}
 
     def _init_cfg(self) -> None:
         self.openai_endpoint      = OPENAI_ENDPOINT
@@ -797,9 +825,11 @@ class FlaskRAGAssistantWithHistory:
                     metadata_str += f" data-steps=\"{metadata['first_step']}-{metadata['last_step']}\""
             
             # Include metadata in the source tag
-            entries.append(f'<source id="{sid}"{metadata_str}>{formatted_chunk}</source>')
-            
-            src_map[str(sid)] = {
+            unique = uuid.uuid4().hex[:8]
+            internal_id = f"S{sid}_{unique}"
+            entries.append(f'<source id="{internal_id}"{metadata_str}>{formatted_chunk}</source>')
+
+            src_map[internal_id] = {
                 "title": res["title"],
                 "content": formatted_chunk,
                 "parent_id": parent_id,  # Include parent_id in source map
@@ -1009,9 +1039,9 @@ class FlaskRAGAssistantWithHistory:
         logger.info("Filtering cited sources from answer")
         cited_sources = []
         
-        # First, check for explicit citations in the format [id]
+        # First, check for explicit citations in the format [id] or internal IDs [S{sid}_{uid}]
         explicit_citations = set()
-        citation_pattern = r'\[(\d+)\]'
+        citation_pattern = r'\[([S]\d+_[0-9a-f]{8}|\d+)\]'
         for match in re.finditer(citation_pattern, answer):
             sid = match.group(1)
             if sid in src_map:
@@ -1091,12 +1121,10 @@ class FlaskRAGAssistantWithHistory:
             answer, cited_sources, [], evaluation, context
         """
         try:
-            if not is_enhanced:
-                # Use the original query for now (query enhancement will be added in a later phase)
-                enhanced_query = query
-            else:
-                enhanced_query = query
-                
+            # Step 1: Enhance query if needed (placeholder for future)
+            enhanced_query = query if is_enhanced else query
+
+            # Step 2: Retrieve from vector search
             kb_results = self.search_knowledge_base(enhanced_query)
             if not kb_results:
                 return (
@@ -1107,33 +1135,44 @@ class FlaskRAGAssistantWithHistory:
                     "",
                 )
 
+
+            # Step 3: Prepare context and build a fresh src_map
             context, src_map = self._prepare_context(kb_results)
-            
-            # Use the conversation history to generate the answer
+
+            # Step 4: Persist into cumulative source map
+            # so that follow‐up responses can cite prior sources as well
+            self._cumulative_src_map.update(src_map)
+
+            # Step 5: Generate the actual answer using chat
             answer = self._chat_answer_with_history(query, context, src_map)
 
-            # Collect only the sources actually cited
-            cited_raw = self._filter_cited(answer, src_map)
+            # Step 6: Filter citations across all seen sources
+            cited_raw = self._filter_cited(answer, self._cumulative_src_map)
 
-            # Renumber in cited order: 1, 2, 3…
+
+            # Step 7: Renumber citations in order of appearance
             renumber_map = {}
             cited_sources = []
             for new_id, src in enumerate(cited_raw, 1):
                 old_id = src["id"]
                 renumber_map[old_id] = str(new_id)
                 entry = {
-                    "id": str(new_id), 
-                    "title": src["title"], 
+                    "id": str(new_id),
+                    "title": src["title"],
                     "content": src["content"],
-                    "parent_id": src.get("parent_id", ""),  # Include parent_id in cited sources
+                    "parent_id": src.get("parent_id", ""),
                     "is_procedural": src.get("is_procedural", False)
                 }
                 if "url" in src:
                     entry["url"] = src["url"]
                 cited_sources.append(entry)
+
+            # Apply new numbering to the answer text
             for old, new in renumber_map.items():
                 answer = re.sub(rf"\[{old}\]", f"[{new}]", answer)
 
+
+            # Step 8: (Optional) run fact check
             evaluation = self.fact_checker.evaluate_response(
                 query=query,
                 answer=answer,
@@ -1141,26 +1180,20 @@ class FlaskRAGAssistantWithHistory:
                 deployment=self.deployment_name,
             )
             
-            # Log the query, response, and sources to the database
+            # Step 9: Persist query + response + sources in your DB
             try:
-                # Get the SQL query used to retrieve the results (if available)
-                sql_query = None
-                # If you have access to the actual SQL query used, set it here
-                
-                # Log the query to the database
                 DatabaseManager.log_rag_query(
                     query=query,
                     response=answer,
                     sources=cited_sources,
                     context=context,
-                    sql_query=sql_query
+                    sql_query=None
                 )
             except Exception as log_exc:
                 logger.error(f"Error logging RAG query to database: {log_exc}")
-                # Continue even if logging fails
-            
+
             return answer, cited_sources, [], evaluation, context
-        
+
         except Exception as exc:
             logger.error("RAG generation error: %s", exc)
             return (
@@ -1724,7 +1757,8 @@ def run_phase3_tests():
     tests = [
         test_query_type_detection,
         test_prompt_selection,
-        test_history_summarization
+        test_history_summarization,
+        test_internal_citation_detection
     ]
     
     results = []

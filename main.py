@@ -13,8 +13,17 @@ from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify, render_template_string, Response, send_from_directory, session
 
-load_dotenv() 
-sas_token = os.getenv("SAS_TOKEN", "")
+load_dotenv()
+
+def get_sas_token():
+    token = os.getenv("SAS_TOKEN")
+    if not token:
+        from generate_sas_token import generate_sas_token
+        token = generate_sas_token()
+        os.environ["SAS_TOKEN"] = token
+        print("Generated new SAS token")
+        print(f"SAS_TOKEN={token}")
+    return token
 
 # Import the improved RAG implementation
 from rag_assistant_v2 import FlaskRAGAssistantWithHistory 
@@ -69,6 +78,16 @@ HTML_TEMPLATE = """
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="/static/js/marked-renderer.js"></script>
    <script src="/static/js/feedback-integration.js"></script>
+   <script defer src="/static/js/url-decoder.js"></script>
+   <script defer src="/static/js/dynamic-container.js"></script>
+   <script>
+     window.APP_CONFIG = { sasToken: "{{ sas_token }}" };
+     console.log("Injected SAS_TOKEN:", window.APP_CONFIG.sasToken);
+   </script>
+   <script>
+     window.APP_CONFIG = { sasToken: "{{ sas_token }}" };
+     console.log("Injected SAS_TOKEN:", window.APP_CONFIG.sasToken);
+   </script>
   <style id="custom-styles">
     /* Same styles as in main.py */
     .avatar {
@@ -433,7 +452,8 @@ def index():
         session['session_id'] = os.urandom(16).hex()
         logger.info(f"New session created: {session['session_id']}")
     
-    return render_template_string(HTML_TEMPLATE, sas_token=sas_token)
+    token = get_sas_token()
+    return render_template("index.html", sas_token=token)
 
 @app.route("/api/query", methods=["POST"])
 def api_query():
@@ -561,4 +581,4 @@ if __name__ == "__main__":
     port = args.port
     logger.info(f"Starting Improved Flask app on port {port}")
 
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

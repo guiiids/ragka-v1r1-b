@@ -5,7 +5,7 @@ WORKDIR /app
 # Pre-copy only requirements to leverage layer caching
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt azure-storage-blob
 
 # Copy the rest of the app
 COPY . .
