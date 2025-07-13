@@ -711,30 +711,42 @@ class FlaskRAGAssistantWithHistory:
         return messages, dropped
 
     def _summarize_messages(self, messages: List[Dict]) -> str:
-        """Summarize a list of conversation messages using the OpenAI service."""
+        """Summarize only the last user question and assistant response, including source titles."""
         summary_temp = self.summarization_settings.get("summary_temperature", 0.3)
         max_tokens = self.summarization_settings.get("max_summary_tokens", 800)
 
-        text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-        prompt = (
-            "Summarize the following conversation so it can be used as context "
-            "for future messages:\n" + text
+        # Extract the last user question and assistant reply
+        last_user = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), "")
+        last_assistant = next((m['content'] for m in reversed(messages) if m['role'] == 'assistant'), "")
+
+        # Collect document titles from last search context
+        titles = []
+        if hasattr(self, "_last_src_map"):
+            titles = [info.get("title", "Untitled") for info in self._last_src_map.values()]
+        titles_str = "; ".join(titles)
+
+        # Build the summarization prompt
+        prompt_text = (
+            f"Summarize the following exchange. Docs used: {titles_str}\n"
+            f"User: {last_user}\n"
+            f"Assistant: {last_assistant}\n"
+            f"Do not include page numbers or citations, only mention titles if necessary."
         )
 
+        msg_payload = [{"role": "user", "content": prompt_text}]
+
+        # Call the OpenAI service for summarization
         if self.deployment_name == CHAT_DEPLOYMENT_O4_MINI:
-            summary = self.openai_service.get_chat_response(
-                messages=[{"role": "user", "content": prompt}],
+            return self.openai_service.get_chat_response(
+                messages=msg_payload,
                 temperature=summary_temp,
                 max_completion_tokens=max_tokens,
             )
-        else:
-            summary = self.openai_service.get_chat_response(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=summary_temp,
-                max_tokens=max_tokens,
-            )
-
-        return summary
+        return self.openai_service.get_chat_response(
+            messages=msg_payload,
+            temperature=summary_temp,
+            max_tokens=max_tokens,
+        )
 
     def _prepare_context(self, results: List[Dict]) -> Tuple[str, Dict]:
         logger.info(f"Preparing context from {len(results)} search results")
@@ -803,6 +815,8 @@ class FlaskRAGAssistantWithHistory:
 
         logger.info(f"Prepared context with {valid_chunks} valid chunks and {len(src_map)} sources")
         logger.info(f"Context contains procedural content: {has_procedural_content}")
+        # Save the last source map for summarization
+        self._last_src_map = src_map
         
         return context_str, src_map
 
