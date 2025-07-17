@@ -23,3 +23,6 @@ logs/
 .DS_Store
 Thumbs.db
 
+conversation_manager_copy.py
+.venv/
+# Ignore specific files that are not part of the project

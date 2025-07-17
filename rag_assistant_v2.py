@@ -328,7 +328,7 @@ def is_procedural_content(text: str) -> bool:
 def test_internal_citation_detection():
     """Test detection of internal citation IDs in answers."""
     test_logger.info("Running test_internal_citation_detection")
-    assistant = FlaskRAGAssistantWithHistory()
+    assistant = FlaskRAGAssistantV2()
     # Prepare a fake src_map with internal ID
     src_map = {
         "S1_ab12cd34": {
@@ -353,7 +353,7 @@ def test_internal_citation_detection():
     return False
 
 
-class FlaskRAGAssistantWithHistory:
+class FlaskRAGAssistantV2:
     """Retrieval-Augmented Generation assistant that maintains conversation
     history, summarizes older turns when needed, and provides improved
     handling of procedural content."""
@@ -543,7 +543,7 @@ class FlaskRAGAssistantWithHistory:
         self.settings = settings or {}
         self._load_settings()
         
-        logger.info("FlaskRAGAssistantWithHistory initialized with conversation history")
+        logger.info("FlaskRAGAssistantV2 initialized with conversation history")
         self._cumulative_src_map = {}
 
     def _init_cfg(self) -> None:
@@ -852,97 +852,134 @@ class FlaskRAGAssistantWithHistory:
 
     def detect_query_type(self, query: str, conversation_history: List[Dict] = None) -> str:
         """
-        Detect if the query is asking for procedural information.
+        Detect the user's intent to route the query appropriately.
         
         Args:
             query: The user query
             conversation_history: Optional conversation history for context
             
         Returns:
-            "procedural" or "informational"
+            One of: "HISTORY_RECALL", "CONTEXTUAL_FOLLOW_UP", 
+                   "NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"
         """
-        # Enhanced procedural patterns
+        query_lower = query.lower()
+        logger.info(f"Detecting query type for: '{query_lower}'")
+
+        # 1. Check for direct history recall
+        recall_patterns = [
+            r'what (was|did) (i|we) (ask|say)',
+            r'what was my (first|previous|last|earlier) question',
+            r'what (have|did) (we|you) (discuss|talk about)',
+            r'(summarize|recap) (our|the) (conversation|discussion)'
+        ]
+        for pattern in recall_patterns:
+            if re.search(pattern, query_lower):
+                logger.info(f"Query '{query}' detected as HISTORY_RECALL")
+                return "HISTORY_RECALL"
+
+        # 2. Check for contextual follow-ups that don't need a new search
+        follow_up_patterns = [
+            r'tell me more about (that|it|item|point|number|the (first|last|next|previous) one)',
+            r'elaborate on (that|it|this|those|these)',
+            r'more details on (item|point|number|the first one|the last one|\d+)',
+            r'(explain|clarify) (that|this|it) (further|more|again)',
+            r'(can you|please) (expand|go into detail) (on|about) (that|this|it)',
+            r'why (is|are|does) (that|it|this)',
+            r'how (does|do|is) (that|it|this) (work|function|operate)'
+        ]
+        for pattern in follow_up_patterns:
+            if re.search(pattern, query_lower):
+                logger.info(f"Query '{query}' detected as CONTEXTUAL_FOLLOW_UP via pattern match")
+                return "CONTEXTUAL_FOLLOW_UP"
+            
+        # 3. Check for short follow-up queries
+        if len(query_lower.split()) <= 5:
+            short_followup_patterns = [
+                r'^(why|how|what|when|where|who)\?*$',
+                r'^(and|but) (then|what|how|why)',
+                r'^what (else|next)',  # Removed 'about' to handle "what about X" separately
+                r'^(tell|show) me more',
+                r'^(go on|continue|proceed)',
+                r'^(explain|elaborate)$'
+            ]
+            for pattern in short_followup_patterns:
+                if re.search(pattern, query_lower):
+                    logger.info(f"Short query '{query}' detected as CONTEXTUAL_FOLLOW_UP")
+                    return "CONTEXTUAL_FOLLOW_UP"
+
+        # 4. Check conversation history for context
+        if conversation_history:
+            # If we have recent messages, check if this is a follow-up
+            if len(conversation_history) >= 3:  # At least system + user + assistant
+                logger.info(f"Checking conversation history with {len(conversation_history)} messages")
+                # Get the last few exchanges
+                recent_history = conversation_history[-4:] if len(conversation_history) >= 4 else conversation_history
+                
+                # Check if there are references to previous content
+                for message in recent_history:
+                    if message.get("role") == "assistant":
+                        prev_response = message.get("content", "").lower()
+                        # If the previous response mentioned numbered items or lists
+                        if re.search(r'(\d+\.\s+|\*\s+|item \d+|point \d+|step \d+)', prev_response):
+                            # And the current query is short or references those items
+                            if len(query_lower.split()) <= 7 or re.search(r'(it|that|this|these|those|the \w+)', query_lower):
+                                logger.info(f"Query '{query}' detected as CONTEXTUAL_FOLLOW_UP based on conversation history")
+                                return "CONTEXTUAL_FOLLOW_UP"
+                
+                # Additional check: if the query contains references to previous content
+                # But exclude "what about X" where X is a new topic
+                if re.search(r'(first one|last one|that one|this one|it|that|this|these|those)', query_lower) and not re.search(r'what about \w+', query_lower):
+                    logger.info(f"Query '{query}' detected as CONTEXTUAL_FOLLOW_UP based on reference terms")
+                    return "CONTEXTUAL_FOLLOW_UP"
+                
+                # Special case for "what about X" where X is a new topic
+                if re.search(r'^what about (\w+)', query_lower):
+                    # Extract the topic
+                    match = re.search(r'^what about (\w+)', query_lower)
+                    if match:
+                        topic = match.group(1)
+                        # Check if this topic has been mentioned in the conversation
+                        topic_mentioned = False
+                        for message in recent_history:
+                            if message.get("role") in ["user", "assistant"] and topic.lower() in message.get("content", "").lower():
+                                topic_mentioned = True
+                                break
+                        
+                        # If the topic hasn't been mentioned, it's likely a new topic
+                        if not topic_mentioned:
+                            logger.info(f"Query '{query}' detected as NEW_TOPIC_INFORMATIONAL (new topic: {topic})")
+                            return "NEW_TOPIC_INFORMATIONAL"
+                
+                # If the query is very short (1-3 words) and we have conversation history, 
+                # it's likely a follow-up, but exclude "what about X" patterns
+                if len(query_lower.split()) <= 3 and not re.search(r'^what about \w+', query_lower):
+                    logger.info(f"Very short query '{query}' detected as CONTEXTUAL_FOLLOW_UP")
+                    return "CONTEXTUAL_FOLLOW_UP"
+
+        # 5. If not a direct follow-up, use existing logic to classify as new topic
+        # Check for procedural patterns
         procedural_patterns = [
-            # How-to patterns
             r'how (to|do|can|would|should) (i|we|you|one)?\s',
-            r'what (is|are) the (steps|procedure|process|way|method) (to|for|of)',
+            r'what (is|are) the (steps|procedure|process)',
             r'(steps|procedure|process|method|approach) (to|for|of)',
             r'(guide|instructions|tutorial|walkthrough) (for|on|to)',
             r'(explain|describe|outline) (how|the steps|the process) (to|for)',
-            
-            # Action-oriented patterns
             r'(create|setup|configure|install|implement|build|deploy|run|execute)',
             r'(add|remove|delete|modify|update|change|edit|customize)',
-            
-            # Question patterns
-            r'(what|which) (steps|actions) (should|do) (i|we|you) (take|follow)',
-            r'(can|could) you (show|tell|walk) me (how|the steps) (to|for)',
-            
-            # Specific procedural keywords
             r'step[- ]by[- ]step',
             r'(workflow|walkthrough|tutorial)',
             r'(in order to|in what order)',
-            
-            # Follow-up patterns for procedural content
-            r'(next step|after that|what next|then what|continue|proceed)',
-            r'(first|second|third|fourth|fifth|last) step',
-            r'(before|after) (i|we|you) (do|complete|finish)'
+            r'(guide|walk|take) me through',
+            r'(show|tell) me how'
         ]
-        
-        # Check the current query
-        query_lower = query.lower()
-        
-        # Special case for "guide me through" and similar phrases
-        if re.search(r'(guide|walk|take) me through', query_lower) or re.search(r'(show|tell) me how', query_lower):
-            logger.info(f"Query '{query}' detected as procedural based on guide/walk pattern")
-            return "procedural"
-            
-        # Check other procedural patterns
         for pattern in procedural_patterns:
             if re.search(pattern, query_lower):
-                logger.info(f"Query '{query}' detected as procedural based on pattern matching")
-                return "procedural"
+                logger.info(f"Query '{query}' detected as NEW_TOPIC_PROCEDURAL")
+                return "NEW_TOPIC_PROCEDURAL"
         
-        # Check if this is a follow-up to a procedural query
-        if conversation_history:
-            # Look at the last few exchanges
-            recent_history = conversation_history[-4:] if len(conversation_history) >= 4 else conversation_history
-            
-            # Check if there was a recent procedural query
-            for message in recent_history:
-                if message.get("role") == "user":
-                    prev_query = message.get("content", "").lower()
-                    # Check if previous query was procedural
-                    for pattern in procedural_patterns:
-                        if re.search(pattern, prev_query):
-                            # This is likely a follow-up to a procedural query
-                            logger.info(f"Query '{query}' detected as procedural based on conversation context")
-                            return "procedural"
-                            
-                # Check if the assistant's previous response mentioned steps or procedures
-                elif message.get("role") == "assistant":
-                    prev_response = message.get("content", "").lower()
-                    if re.search(r'(step \d+|first step|next step|following steps|procedure|process)', prev_response):
-                        # The previous response was about steps or procedures
-                        logger.info(f"Query '{query}' detected as procedural based on previous assistant response")
-                        return "procedural"
-        
-        # Check for short follow-up queries that might be continuing a procedural conversation
-        if len(query_lower.split()) <= 5:
-            # Short queries like "What next?" or "Then what?" in a procedural context
-            if re.search(r'(what|how|then|next|after|continue|more|details)', query_lower):
-                if conversation_history and len(conversation_history) >= 2:
-                    # Check the previous assistant message
-                    for message in reversed(conversation_history):
-                        if message.get("role") == "assistant":
-                            prev_response = message.get("content", "").lower()
-                            if re.search(r'(step \d+|first step|next step|following steps|procedure|process)', prev_response):
-                                logger.info(f"Short query '{query}' detected as procedural follow-up")
-                                return "procedural"
-                            break
-        
-        logger.info(f"Query '{query}' detected as informational")
-        return "informational"
+        # Default to informational for any other query
+        logger.info(f"Query '{query}' detected as NEW_TOPIC_INFORMATIONAL")
+        return "NEW_TOPIC_INFORMATIONAL"
 
     def _chat_answer_with_history(self, query: str, context: str, src_map: Dict) -> str:
         """Generate a response using the conversation history"""
@@ -1111,7 +1148,7 @@ class FlaskRAGAssistantWithHistory:
         self, query: str, is_enhanced: bool = False
     ) -> Tuple[str, List[Dict], List[Dict], Dict[str, Any], str]:
         """
-        Generate a response using RAG with conversation history.
+        Generate a response using the intelligent RAG router.
         
         Args:
             query: The user query
@@ -1121,36 +1158,48 @@ class FlaskRAGAssistantWithHistory:
             answer, cited_sources, [], evaluation, context
         """
         try:
-            # Step 1: Enhance query if needed (placeholder for future)
-            enhanced_query = query if is_enhanced else query
+            # Step 1: Classify the query's intent using the router
+            history = self.conversation_manager.get_history()
+            query_type = self.detect_query_type(query, history)
+            logger.info(f"Query classified as: {query_type}")
 
-            # Step 2: Retrieve from vector search
-            kb_results = self.search_knowledge_base(enhanced_query)
-            if not kb_results:
-                return (
-                    "No relevant information found in the knowledge base.",
-                    [],
-                    [],
-                    {},
-                    "",
-                )
+            context = ""
+            src_map = {}
 
+            # Step 2: Execute action based on intent
+            if query_type in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"]:
+                logger.info(f"Handling '{query_type}'. Performing a fresh knowledge base search.")
+                # For new topics, use the original query or enhanced query if provided
+                enhanced_query = query if is_enhanced else query
+                kb_results = self.search_knowledge_base(enhanced_query)
+                if kb_results:
+                    context, src_map = self._prepare_context(kb_results)
+                    # Update cumulative source map for future reference
+                    self._cumulative_src_map.update(src_map)
+                    logger.info(f"Updated cumulative source map, now contains {len(self._cumulative_src_map)} sources")
+            
+            elif query_type in ["CONTEXTUAL_FOLLOW_UP", "HISTORY_RECALL"]:
+                logger.info(f"Handling '{query_type}'. Skipping search and using conversation history.")
+                # No new context is needed. The model will use the chat history.
+                # We use the cumulative map for citation filtering.
+                src_map = self._cumulative_src_map
+                context = "[No new context provided for this turn. Answer based on the conversation history.]"
+                logger.info(f"Using existing cumulative source map with {len(src_map)} sources")
+            
+            # If no context was set (e.g., no search results for a new topic), provide a fallback
+            if not context:
+                context = "[No relevant information found in the knowledge base.]"
+                logger.warning("No context available, using fallback message")
 
-            # Step 3: Prepare context and build a fresh src_map
-            context, src_map = self._prepare_context(kb_results)
-
-            # Step 4: Persist into cumulative source map
-            # so that follow‐up responses can cite prior sources as well
-            self._cumulative_src_map.update(src_map)
-
-            # Step 5: Generate the actual answer using chat
+            # Step 3: Generate the answer using chat
             answer = self._chat_answer_with_history(query, context, src_map)
+            logger.info(f"Generated answer of length {len(answer)}")
 
-            # Step 6: Filter citations across all seen sources
+            # Step 4: Filter citations across all *seen* sources
             cited_raw = self._filter_cited(answer, self._cumulative_src_map)
+            logger.info(f"Filtered {len(cited_raw)} cited sources from answer")
 
-
-            # Step 7: Renumber citations in order of appearance
+            # Step 5: Renumber citations in order of appearance
             renumber_map = {}
             cited_sources = []
             for new_id, src in enumerate(cited_raw, 1):
@@ -1166,13 +1215,13 @@ class FlaskRAGAssistantWithHistory:
                 if "url" in src:
                     entry["url"] = src["url"]
                 cited_sources.append(entry)
-
+                
             # Apply new numbering to the answer text
             for old, new in renumber_map.items():
                 answer = re.sub(rf"\[{old}\]", f"[{new}]", answer)
+            logger.info(f"Renumbered {len(renumber_map)} citations in the answer")
 
-
-            # Step 8: (Optional) run fact check
+            # Step 6: Run fact check
             evaluation = self.fact_checker.evaluate_response(
                 query=query,
                 answer=answer,
@@ -1180,7 +1229,7 @@ class FlaskRAGAssistantWithHistory:
                 deployment=self.deployment_name,
             )
             
-            # Step 9: Persist query + response + sources in your DB
+            # Step 7: Persist query + response + sources in the DB
             try:
                 DatabaseManager.log_rag_query(
                     query=query,
@@ -1189,13 +1238,14 @@ class FlaskRAGAssistantWithHistory:
                     context=context,
                     sql_query=None
                 )
+                logger.info("Logged RAG query to database")
             except Exception as log_exc:
                 logger.error(f"Error logging RAG query to database: {log_exc}")
 
             return answer, cited_sources, [], evaluation, context
 
         except Exception as exc:
-            logger.error("RAG generation error: %s", exc)
+            logger.error(f"RAG generation error: {exc}", exc_info=True)
             return (
                 "I encountered an error while generating the response.",
                 [],
@@ -1218,24 +1268,45 @@ class FlaskRAGAssistantWithHistory:
             logger.info(f"========== STARTING STREAM RAG RESPONSE WITH HISTORY ==========")
             logger.info(f"Original query: {query}")
             
-            kb_results = self.search_knowledge_base(query)
-            if not kb_results:
-                logger.info("No relevant information found in knowledge base")
+            # Step 1: Classify the query's intent using the router
+            history = self.conversation_manager.get_history()
+            query_type = self.detect_query_type(query, history)
+            logger.info(f"Query classified as: {query_type}")
+            
+            context = ""
+            src_map = {}
+            
+            # Step 2: Execute action based on intent
+            if query_type in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"]:
+                logger.info(f"Handling '{query_type}'. Performing a fresh knowledge base search.")
+                kb_results = self.search_knowledge_base(query)
+                if kb_results:
+                    context, src_map = self._prepare_context(kb_results)
+                    # Update cumulative source map for future reference
+                    self._cumulative_src_map.update(src_map)
+                    logger.info(f"Updated cumulative source map, now contains {len(self._cumulative_src_map)} sources")
+            
+            elif query_type in ["CONTEXTUAL_FOLLOW_UP", "HISTORY_RECALL"]:
+                logger.info(f"Handling '{query_type}'. Skipping search and using conversation history.")
+                # No new context is needed. The model will use the chat history.
+                # We use the cumulative map for citation filtering.
+                src_map = self._cumulative_src_map
+                context = "[No new context provided for this turn. Answer based on the conversation history.]"
+                logger.info(f"Using existing cumulative source map with {len(src_map)} sources")
+            
+            # If no context was set (e.g., no search results for a new topic), provide a fallback
+            if not context:
+                context = "[No relevant information found in the knowledge base.]"
+                logger.warning("No context available, using fallback message")
                 yield "No relevant information found in the knowledge base."
                 yield {
                     "sources": [],
                     "evaluation": {}
                 }
                 return
-
-            context, src_map = self._prepare_context(kb_results)
-            logger.info(f"Retrieved {len(kb_results)} results from knowledge base")
-            
-            # Detect query type
-            query_type = self.detect_query_type(query)
             
             # Select appropriate system prompt based on query type
-            if query_type == "procedural":
+            if query_type.endswith("PROCEDURAL"):
                 system_prompt = self.PROCEDURAL_SYSTEM_PROMPT
                 logger.info("Using procedural system prompt")
             else:
@@ -1313,8 +1384,8 @@ class FlaskRAGAssistantWithHistory:
             # Add the assistant's response to conversation history
             self.conversation_manager.add_assistant_message(collected_answer)
             
-            # Filter cited sources
-            cited_raw = self._filter_cited(collected_answer, src_map)
+            # Filter cited sources from all seen sources
+            cited_raw = self._filter_cited(collected_answer, self._cumulative_src_map)
             
             # Renumber in cited order: 1, 2, 3…
             renumber_map = {}
@@ -1370,14 +1441,14 @@ class FlaskRAGAssistantWithHistory:
             }
             
         except Exception as exc:
-            logger.error("RAG streaming error: %s", exc)
+            logger.error(f"RAG streaming error: {exc}", exc_info=True)
             yield "I encountered an error while generating the response."
             yield {
                 "sources": [],
                 "evaluation": {},
                 "error": str(exc)
             }
-            
+    
     def clear_conversation_history(self, preserve_system_message: bool = True) -> None:
         """
         Clear the conversation history.
@@ -1598,7 +1669,7 @@ def test_query_type_detection():
     test_logger.info("Running test_query_type_detection")
     
     # Create a test instance
-    rag_assistant = FlaskRAGAssistantWithHistory()
+    rag_assistant = FlaskRAGAssistantV2()
     
     # Test procedural queries
     procedural_queries = [
@@ -1660,7 +1731,7 @@ def test_prompt_selection():
     test_logger.info("Running test_prompt_selection")
     
     # Create a test instance
-    rag_assistant = FlaskRAGAssistantWithHistory()
+    rag_assistant = FlaskRAGAssistantV2()
     
     # Mock context and src_map for testing
     context = "<source id=\"1\">Test context</source>"
@@ -1726,7 +1797,7 @@ def test_history_summarization():
     """Test that old history is summarized when trimming."""
     test_logger.info("Running test_history_summarization")
 
-    rag_assistant = FlaskRAGAssistantWithHistory()
+    rag_assistant = FlaskRAGAssistantV2()
     rag_assistant.summarization_settings["enabled"] = True
 
     # Mock summarization response

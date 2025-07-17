@@ -508,15 +508,15 @@ class FlaskRAGAssistant:
         logger.info("FlaskRAGAssistant initialized with conversation history")
 
     def _init_cfg(self) -> None:
-        self.azure_openai_endpoint = AZURE_OPENAI_ENDPOINT
-        self.azure_openai_key = AZURE_OPENAI_KEY
-        self.azure_openai_api_version = AZURE_OPENAI_API_VERSION
-        self.azure_openai_api_version_o4_mini = AZURE_OPENAI_API_VERSION_O4_MINI
+        self.azure_openai_endpoint = OPENAI_ENDPOINT
+        self.azure_openai_key = OPENAI_KEY
+        self.azure_openai_api_version = OPENAI_API_VERSION
+        self.azure_openai_api_version_o4_mini = OPENAI_API_VERSION_O4_MINI
         self.embedding_deployment = EMBEDDING_DEPLOYMENT
         self.deployment_name = CHAT_DEPLOYMENT_O4_MINI # Default to o4-mini
-        self.search_endpoint = AZURE_SEARCH_SERVICE
-        self.search_index = AZURE_SEARCH_INDEX
-        self.search_key = AZURE_SEARCH_KEY
+        self.search_endpoint = SEARCH_ENDPOINT
+        self.search_index = SEARCH_INDEX
+        self.search_key = SEARCH_KEY
         self.vector_field = VECTOR_FIELD
         
     def _get_openai_client(self) -> AzureOpenAI:

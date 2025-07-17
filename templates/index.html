@@ -2,7 +2,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>[Temp]SAGE Knowledge Navigator</title>
+  <title>[clean.py.version]SAGE/KN</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.10.5/dist/cdn.min.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -43,7 +43,7 @@
   <style id="custom-styles">
   .avatar {
     width: 48px;
-    height: 48px;
+    height: 48px; 
     object-fit: cover;
     border-radius: 50%;
   }
@@ -55,6 +55,9 @@
       margin: 0;
       padding: 0;
       overflow: hidden;
+      background-image: url('/assets/bg_png.png');
+      background-repeat: repeat;
+      background-position: top left;
     }
     .chat-container {
       display: flex;
@@ -245,16 +248,15 @@
     <!-- Chat Messages Area -->
     <div id="chat-messages" class="chat-messages">
       <!-- Logo centered in message area before first message -->
-      <div id="center-logo" class="flex flex-col items-center justify-center h-full ">
-        <img id="random-logo" class="h-160 w-auto inline-block object-cover md:h-80" alt="Logo" src="/assets/">
-
+      <div id="center-logo" class="flex flex-col items-center justify-center h-[50vh]">
+        <img id="random-logo" class="h-auto w-auto inline-block object-cover md:h-60" alt="Logo" src="/assets/">
       </div>
       <script>  
       (function() {
         const logos = [
           
          
-          'https://content.tst-34.aws.agilent.com/wp-content/uploads/2025/06/sage_icon_logo.png',
+          'https://content.tst-34.aws.agilent.com/wp-content/uploads/2025/07/16.png',
           
         ];
         const chosen = logos[Math.floor(Math.random() * logos.length)];
@@ -281,7 +283,12 @@
     
     <!-- Chat Input Area -->
      <div class="chat-input bg-white dark:bg-black text-gray-900 dark:text-white">
-    <div class="relative rounded-3xl border border-gray-300 p-4 bg-white dark:bg-black text-gray-900 dark:text-white max-w-3xl mx-auto mt-10 shadow-md">
+      
+      <p class="text-sm text-gray-700 mb-2 text-center">
+    SAGE can make mistakes. Verify important info.
+      </p>
+                                         
+      <div class="relative rounded-3xl border border-gray-300 p-4 bg-white dark:bg-black text-gray-900 dark:text-white max-w-3xl mx-auto mt-4 shadow-md">
       <div class="flex items-center space-x-2">
         <!-- Dynamic textarea -->
         <textarea
@@ -320,13 +327,16 @@
         </div>
         <button
           id="submit-btn"
-          class="rounded-2xl bg-gradient-to-r from-blue-800 to-blue-400 py-2 px-4 border border-transparent text-center text-sm text-white transition-all shadow-sm hover:opacity-90 focus:opacity-95 focus:shadow-none active:opacity-95 disabled:pointer-events-none disabled:opacity-50 disabled:shadow-none"
+          class="rounded-2xl bg-gradient-to-r from-blue-800 to-blue-400 dark:bg-gradient-to-none dark:bg-gray-400 dark:text-black py-2 px-4 border border-transparent text-center text-sm text-white transition-all shadow-sm hover:opacity-90 focus:opacity-95 focus:shadow-none active:opacity-95 disabled:pointer-events-none disabled:opacity-50 disabled:shadow-none"
           type="button"
         >
           Send
         </button>
       </div>
+   
     </div>
+          
+
     </div>
     <div class="flex items-center justify-center ml-4 overflow-visible">
       <button id="toggle-console-btn" class="group hidden px-3 py-1 w-full bg-white dark:bg-black text-white hover:bg-gray-300 text-gray-800 rounded relative inline-flex items-center justify-center">
@@ -827,10 +837,10 @@
 <script src="/static/js/unifiedEval.js"></script> 
 <script src="/static/js/custom.js"></script> <!-- This file is empty/deprecated -->
 <script src="/static/js/debug-logger.js"></script>
-<script>
+<!-- <script>
   window.APP_CONFIG = { sasToken: "{{ sas_token|safe }}" };
   console.log("Injected SAS_TOKEN:", window.APP_CONFIG.sasToken);
-</script>
+</script> -->
 <script src="/static/js/url-decoder.js"></script> <!-- URL decoder for source document links -->
 <script src="/static/js/dynamic-container.js"></script>
 <!-- <script src="/static/js/citation-toggle.js"></script> --> <!-- Removed -->

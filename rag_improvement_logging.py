@@ -23,6 +23,14 @@ def setup_improvement_logging():
     if logger.handlers:
         logger.handlers.clear()
     
+    # Clear default root handlers to avoid duplicate logs
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        root_logger.handlers.clear()
+    
+    # Prevent logs from propagating to the root logger
+    logger.propagate = False
+    
     # Create logs directory if it doesn't exist
     os.makedirs('logs', exist_ok=True)
     
@@ -34,25 +42,14 @@ def setup_improvement_logging():
     )
     file_handler.setLevel(logging.DEBUG)
     
-    # Create console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    
-    # Create formatters
+    # Create formatter for file handler
     file_formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - [%(name)s] - %(message)s'
     )
-    console_formatter = logging.Formatter(
-        '%(levelname)s - [%(name)s] - %(message)s'
-    )
-    
-    # Set formatters
     file_handler.setFormatter(file_formatter)
-    console_handler.setFormatter(console_formatter)
     
-    # Add handlers to logger
+    # Add file handler to logger
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
     
     return logger
 

@@ -36,7 +36,7 @@ def get_sas_token():
     return token
 
 # Import the improved RAG implementation
-from rag_assistant import FlaskRAGAssistant
+from rag_assistant_v2 import FlaskRAGAssistantV2
 from db_manager import DatabaseManager
 from openai import AzureOpenAI
 from config import get_cost_rates
@@ -73,7 +73,7 @@ def get_rag_assistant(session_id):
     """Get or create a RAG assistant for the given session ID"""
     if session_id not in rag_assistants:
         logger.info(f"Creating new RAG assistant for session {session_id}")
-        rag_assistants[session_id] = FlaskRAGAssistant()
+        rag_assistants[session_id] = FlaskRAGAssistantV2()
     return rag_assistants[session_id]
 
 @app.route("/", methods=["GET"])
