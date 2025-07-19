@@ -20,3 +20,39 @@ def log_openai_call(request: dict, response) -> None:
     path = os.path.join('logs', 'openai_calls.jsonl')
     with _log_lock, open(path, 'a') as f:
         f.write(json.dumps(record) + "\\n")
+
+def log_openai_usage(request: dict, response) -> None:
+    """
+    Append user query, response text, and usage info as a JSON object
+    (one per line) into logs/openai_usage.jsonl.
+    """
+    os.makedirs('logs', exist_ok=True)
+
+    # Extract user query from request messages (last user message content)
+    user_query = None
+    messages = request.get("messages", [])
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and "content" in msg:
+            user_query = msg["content"]
+            break
+
+    # Extract response text from response object
+    response_dict = response.to_dict() if hasattr(response, "to_dict") else dict(response)
+    response_text = None
+    try:
+        response_text = response_dict["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        response_text = None
+
+    # Extract usage info if available
+    usage = response_dict.get("usage")
+
+    record = {
+        "timestamp": time.time(),
+        "user_query": user_query,
+        "response_text": response_text,
+        "usage": usage
+    }
+    path = os.path.join('logs', 'openai_usage.jsonl')
+    with _log_lock, open(path, 'a') as f:
+        f.write(json.dumps(record) + "\\n")

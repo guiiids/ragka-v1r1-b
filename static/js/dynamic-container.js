@@ -12,7 +12,6 @@ class DynamicContainer {
     this.container = null;
     this.chatContainer = null;
     this.init();
-    console.log("DynamicContainer: constructor called");
     
     // Log initialization if debug logger is available
     if (window.debugLogger) {
@@ -21,7 +20,6 @@ class DynamicContainer {
   }
 
   init() {
-    console.log("DynamicContainer: init() invoked");
     // Get the main chat container
     this.chatContainer = document.querySelector('.chat-container');
     if (!this.chatContainer) {
@@ -170,7 +168,6 @@ class DynamicContainer {
     document.addEventListener('click', (e) => {
       const citationLink = e.target.closest('.citation-link');
       if (citationLink) {
-        console.log("dynamic-container: click caught on citation-link", citationLink);
         e.preventDefault();
         this.handleCitationClick(citationLink);
         return;

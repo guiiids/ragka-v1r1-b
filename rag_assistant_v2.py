@@ -9,7 +9,6 @@ from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 from azure.core.credentials import AzureKeyCredential
 import re
-import uuid
 import sys
 import os
 import json
@@ -18,6 +17,9 @@ from db_manager import DatabaseManager
 from conversation_manager import ConversationManager
 from openai_service import OpenAIService
 from rag_improvement_logging import get_phase_logger, get_checkpoint_logger, get_test_logger, get_compare_logger
+from enhanced_pattern_matcher import EnhancedPatternMatcher
+from conversation_context_analyzer import ConversationContextAnalyzer
+from routing_logger import RoutingDecisionLogger
 
 # Import config but handle the case where it might import streamlit
 try:
@@ -318,12 +320,12 @@ def is_procedural_content(text: str) -> bool:
     # Check for numbered steps (e.g., "1. Do this")
     if re.search(r'\d+\.\s+[A-Z]', text):
         return True
-
+    
     # Check for instructional keywords
     instructional_keywords = ['follow', 'steps', 'procedure', 'instructions', 'guide']
     if any(keyword in text.lower() for keyword in instructional_keywords):
         return True
-
+        
     return False
 def test_internal_citation_detection():
     """Test detection of internal citation IDs in answers."""
@@ -506,6 +508,11 @@ class FlaskRAGAssistantV2:
             api_version=self.openai_api_version or "2023-05-15",
             deployment_name=self.deployment_name
         )
+        
+        # Initialize enhanced components
+        self.pattern_matcher = EnhancedPatternMatcher()
+        self.context_analyzer = ConversationContextAnalyzer()
+        self.routing_logger = RoutingDecisionLogger()
         
         # Initialize the conversation manager with the system prompt
         self.conversation_manager = ConversationManager(self.DEFAULT_SYSTEM_PROMPT)
@@ -767,13 +774,11 @@ class FlaskRAGAssistantV2:
         if self.deployment_name == CHAT_DEPLOYMENT_O4_MINI:
             return self.openai_service.get_chat_response(
                 messages=msg_payload,
-                temperature=summary_temp,
                 max_completion_tokens=max_tokens,
             )
         return self.openai_service.get_chat_response(
             messages=msg_payload,
-            temperature=summary_temp,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
         )
 
     def _prepare_context(self, results: List[Dict]) -> Tuple[str, Dict]:
@@ -825,11 +830,9 @@ class FlaskRAGAssistantV2:
                     metadata_str += f" data-steps=\"{metadata['first_step']}-{metadata['last_step']}\""
             
             # Include metadata in the source tag
-            unique = uuid.uuid4().hex[:8]
-            internal_id = f"S{sid}_{unique}"
-            entries.append(f'<source id="{internal_id}"{metadata_str}>{formatted_chunk}</source>')
-
-            src_map[internal_id] = {
+            entries.append(f'<source id="{sid}"{metadata_str}>{formatted_chunk}</source>')
+            
+            src_map[str(sid)] = {
                 "title": res["title"],
                 "content": formatted_chunk,
                 "parent_id": parent_id,  # Include parent_id in source map
@@ -852,7 +855,8 @@ class FlaskRAGAssistantV2:
 
     def detect_query_type(self, query: str, conversation_history: List[Dict] = None) -> str:
         """
-        Detect the user's intent to route the query appropriately.
+        Detect the user's intent to route the query appropriately using enhanced pattern matching
+        and context analysis.
         
         Args:
             query: The user query
@@ -862,124 +866,43 @@ class FlaskRAGAssistantV2:
             One of: "HISTORY_RECALL", "CONTEXTUAL_FOLLOW_UP", 
                    "NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"
         """
-        query_lower = query.lower()
-        logger.info(f"Detecting query type for: '{query_lower}'")
-
-        # 1. Check for direct history recall
-        recall_patterns = [
-            r'what (was|did) (i|we) (ask|say)',
-            r'what was my (first|previous|last|earlier) question',
-            r'what (have|did) (we|you) (discuss|talk about)',
-            r'(summarize|recap) (our|the) (conversation|discussion)'
-        ]
-        for pattern in recall_patterns:
-            if re.search(pattern, query_lower):
-                logger.info(f"Query '{query}' detected as HISTORY_RECALL")
-                return "HISTORY_RECALL"
-
-        # 2. Check for contextual follow-ups that don't need a new search
-        follow_up_patterns = [
-            r'tell me more about (that|it|item|point|number|the (first|last|next|previous) one)',
-            r'elaborate on (that|it|this|those|these)',
-            r'more details on (item|point|number|the first one|the last one|\d+)',
-            r'(explain|clarify) (that|this|it) (further|more|again)',
-            r'(can you|please) (expand|go into detail) (on|about) (that|this|it)',
-            r'why (is|are|does) (that|it|this)',
-            r'how (does|do|is) (that|it|this) (work|function|operate)'
-        ]
-        for pattern in follow_up_patterns:
-            if re.search(pattern, query_lower):
-                logger.info(f"Query '{query}' detected as CONTEXTUAL_FOLLOW_UP via pattern match")
-                return "CONTEXTUAL_FOLLOW_UP"
-            
-        # 3. Check for short follow-up queries
-        if len(query_lower.split()) <= 5:
-            short_followup_patterns = [
-                r'^(why|how|what|when|where|who)\?*$',
-                r'^(and|but) (then|what|how|why)',
-                r'^what (else|next)',  # Removed 'about' to handle "what about X" separately
-                r'^(tell|show) me more',
-                r'^(go on|continue|proceed)',
-                r'^(explain|elaborate)$'
-            ]
-            for pattern in short_followup_patterns:
-                if re.search(pattern, query_lower):
-                    logger.info(f"Short query '{query}' detected as CONTEXTUAL_FOLLOW_UP")
-                    return "CONTEXTUAL_FOLLOW_UP"
-
-        # 4. Check conversation history for context
-        if conversation_history:
-            # If we have recent messages, check if this is a follow-up
-            if len(conversation_history) >= 3:  # At least system + user + assistant
-                logger.info(f"Checking conversation history with {len(conversation_history)} messages")
-                # Get the last few exchanges
-                recent_history = conversation_history[-4:] if len(conversation_history) >= 4 else conversation_history
-                
-                # Check if there are references to previous content
-                for message in recent_history:
-                    if message.get("role") == "assistant":
-                        prev_response = message.get("content", "").lower()
-                        # If the previous response mentioned numbered items or lists
-                        if re.search(r'(\d+\.\s+|\*\s+|item \d+|point \d+|step \d+)', prev_response):
-                            # And the current query is short or references those items
-                            if len(query_lower.split()) <= 7 or re.search(r'(it|that|this|these|those|the \w+)', query_lower):
-                                logger.info(f"Query '{query}' detected as CONTEXTUAL_FOLLOW_UP based on conversation history")
-                                return "CONTEXTUAL_FOLLOW_UP"
-                
-                # Additional check: if the query contains references to previous content
-                # But exclude "what about X" where X is a new topic
-                if re.search(r'(first one|last one|that one|this one|it|that|this|these|those)', query_lower) and not re.search(r'what about \w+', query_lower):
-                    logger.info(f"Query '{query}' detected as CONTEXTUAL_FOLLOW_UP based on reference terms")
-                    return "CONTEXTUAL_FOLLOW_UP"
-                
-                # Special case for "what about X" where X is a new topic
-                if re.search(r'^what about (\w+)', query_lower):
-                    # Extract the topic
-                    match = re.search(r'^what about (\w+)', query_lower)
-                    if match:
-                        topic = match.group(1)
-                        # Check if this topic has been mentioned in the conversation
-                        topic_mentioned = False
-                        for message in recent_history:
-                            if message.get("role") in ["user", "assistant"] and topic.lower() in message.get("content", "").lower():
-                                topic_mentioned = True
-                                break
-                        
-                        # If the topic hasn't been mentioned, it's likely a new topic
-                        if not topic_mentioned:
-                            logger.info(f"Query '{query}' detected as NEW_TOPIC_INFORMATIONAL (new topic: {topic})")
-                            return "NEW_TOPIC_INFORMATIONAL"
-                
-                # If the query is very short (1-3 words) and we have conversation history, 
-                # it's likely a follow-up, but exclude "what about X" patterns
-                if len(query_lower.split()) <= 3 and not re.search(r'^what about \w+', query_lower):
-                    logger.info(f"Very short query '{query}' detected as CONTEXTUAL_FOLLOW_UP")
-                    return "CONTEXTUAL_FOLLOW_UP"
-
-        # 5. If not a direct follow-up, use existing logic to classify as new topic
-        # Check for procedural patterns
-        procedural_patterns = [
-            r'how (to|do|can|would|should) (i|we|you|one)?\s',
-            r'what (is|are) the (steps|procedure|process)',
-            r'(steps|procedure|process|method|approach) (to|for|of)',
-            r'(guide|instructions|tutorial|walkthrough) (for|on|to)',
-            r'(explain|describe|outline) (how|the steps|the process) (to|for)',
-            r'(create|setup|configure|install|implement|build|deploy|run|execute)',
-            r'(add|remove|delete|modify|update|change|edit|customize)',
-            r'step[- ]by[- ]step',
-            r'(workflow|walkthrough|tutorial)',
-            r'(in order to|in what order)',
-            r'(guide|walk|take) me through',
-            r'(show|tell) me how'
-        ]
-        for pattern in procedural_patterns:
-            if re.search(pattern, query_lower):
-                logger.info(f"Query '{query}' detected as NEW_TOPIC_PROCEDURAL")
-                return "NEW_TOPIC_PROCEDURAL"
+        logger.info(f"Detecting query type for: '{query}'")
         
-        # Default to informational for any other query
-        logger.info(f"Query '{query}' detected as NEW_TOPIC_INFORMATIONAL")
-        return "NEW_TOPIC_INFORMATIONAL"
+        # NEW: Start performance timing
+        import time
+        start_time = time.time()
+        
+        # Get pattern-based classification
+        query_type, confidence = self.pattern_matcher.classify_query(query, conversation_history)
+        
+        # Get context-based analysis
+        context_scores = self.context_analyzer.analyze_context(query, conversation_history)
+        
+        # NEW: Calculate performance metrics
+        response_time_ms = (time.time() - start_time) * 1000
+        
+        # Log the decision for analysis
+        self.routing_logger.log_decision(
+            query=query,
+            detected_type=query_type,
+            confidence=confidence,
+            search_performed=query_type.startswith("NEW_TOPIC"),
+            conversation_context=conversation_history,
+            pattern_matches=self.pattern_matcher.get_confidence_explanation(query, query_type, confidence),
+            processing_time_ms=response_time_ms
+        )
+        
+        # NEW: Log performance metrics
+        self.routing_logger.log_performance_metrics(
+            query=query,
+            classification_method='regex',  # Will be dynamic in Phase 1B
+            response_time_ms=response_time_ms,
+            confidence=confidence,
+            cache_key=f"intent:{hash(query)}:{len(conversation_history) if conversation_history else 0}"
+        )
+        
+        logger.info(f"Query '{query}' detected as {query_type} with confidence {confidence:.2f}")
+        return query_type
 
     def _chat_answer_with_history(self, query: str, context: str, src_map: Dict) -> str:
         """Generate a response using the conversation history"""
@@ -1037,34 +960,27 @@ class FlaskRAGAssistantV2:
         payload = {
             "model": self.deployment_name,
             "messages": messages,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
+
+          
         }
         if self.deployment_name == CHAT_DEPLOYMENT_O4_MINI:
             payload["max_completion_tokens"] = self.max_completion_tokens
         else:
-            payload["max_tokens"] = self.max_completion_tokens
+            payload["max_completion_tokens"] = self.max_completion_tokens
         logger.info("========== OPENAI RAW PAYLOAD ==========")
         logger.info(json.dumps(payload, indent=2))
         if self.deployment_name == CHAT_DEPLOYMENT_O4_MINI:
             response = self.openai_service.get_chat_response(
                 messages=messages,
-                temperature=self.temperature,
                 max_completion_tokens=self.max_completion_tokens,
-                top_p=self.top_p,
-                presence_penalty=self.presence_penalty,
-                frequency_penalty=self.frequency_penalty,
+               
             )
         else:
             response = self.openai_service.get_chat_response(
                 messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_completion_tokens,
-                top_p=self.top_p,
-                presence_penalty=self.presence_penalty,
-                frequency_penalty=self.frequency_penalty,
+                max_completion_tokens=self.max_completion_tokens,
+             
+               
             )
         
         # Add the assistant's response to conversation history
@@ -1076,9 +992,9 @@ class FlaskRAGAssistantV2:
         logger.info("Filtering cited sources from answer")
         cited_sources = []
         
-        # First, check for explicit citations in the format [id] or internal IDs [S{sid}_{uid}]
+        # First, check for explicit citations in the format [id]
         explicit_citations = set()
-        citation_pattern = r'\[([S]\d+_[0-9a-f]{8}|\d+)\]'
+        citation_pattern = r'\[(\d+)\]'
         for match in re.finditer(citation_pattern, answer):
             sid = match.group(1)
             if sid in src_map:
@@ -1158,25 +1074,33 @@ class FlaskRAGAssistantV2:
             answer, cited_sources, [], evaluation, context
         """
         try:
+            logger.info(f"========== STARTING RAG RESPONSE WITH INTELLIGENT ROUTING ==========")
+            logger.info(f"Original query: {query}")
+            
             # Step 1: Classify the query's intent using the router
             history = self.conversation_manager.get_history()
             query_type = self.detect_query_type(query, history)
             logger.info(f"Query classified as: {query_type}")
-
+            
             context = ""
             src_map = {}
-
+            
             # Step 2: Execute action based on intent
             if query_type in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"]:
                 logger.info(f"Handling '{query_type}'. Performing a fresh knowledge base search.")
-                # For new topics, use the original query or enhanced query if provided
-                enhanced_query = query if is_enhanced else query
-                kb_results = self.search_knowledge_base(enhanced_query)
-                if kb_results:
-                    context, src_map = self._prepare_context(kb_results)
-                    # Update cumulative source map for future reference
-                    self._cumulative_src_map.update(src_map)
-                    logger.info(f"Updated cumulative source map, now contains {len(self._cumulative_src_map)} sources")
+                kb_results = self.search_knowledge_base(query)
+                if not kb_results:
+                    return (
+                        "No relevant information found in the knowledge base.",
+                        [],
+                        [],
+                        {},
+                        "",
+                    )
+                context, src_map = self._prepare_context(kb_results)
+                # Update cumulative source map for future reference
+                self._cumulative_src_map.update(src_map)
+                logger.info(f"Updated cumulative source map, now contains {len(self._cumulative_src_map)} sources")
             
             elif query_type in ["CONTEXTUAL_FOLLOW_UP", "HISTORY_RECALL"]:
                 logger.info(f"Handling '{query_type}'. Skipping search and using conversation history.")
@@ -1190,14 +1114,20 @@ class FlaskRAGAssistantV2:
             if not context:
                 context = "[No relevant information found in the knowledge base.]"
                 logger.warning("No context available, using fallback message")
+                return (
+                    "No relevant information found in the knowledge base.",
+                    [],
+                    [],
+                    {},
+                    "",
+                )
 
-            # Step 3: Generate the answer using chat
+            # Step 3: Generate the actual answer using chat
             answer = self._chat_answer_with_history(query, context, src_map)
             logger.info(f"Generated answer of length {len(answer)}")
 
-            # Step 4: Filter citations across all *seen* sources
+            # Step 4: Filter citations across all seen sources
             cited_raw = self._filter_cited(answer, self._cumulative_src_map)
-            logger.info(f"Filtered {len(cited_raw)} cited sources from answer")
 
             # Step 5: Renumber citations in order of appearance
             renumber_map = {}
@@ -1206,22 +1136,22 @@ class FlaskRAGAssistantV2:
                 old_id = src["id"]
                 renumber_map[old_id] = str(new_id)
                 entry = {
-                    "id": str(new_id),
-                    "title": src["title"],
+                    "id": str(new_id), 
+                    "title": src["title"], 
                     "content": src["content"],
-                    "parent_id": src.get("parent_id", ""),
+                    "parent_id": src.get("parent_id", ""),  # Include parent_id in cited sources
                     "is_procedural": src.get("is_procedural", False)
                 }
                 if "url" in src:
                     entry["url"] = src["url"]
                 cited_sources.append(entry)
-                
+
             # Apply new numbering to the answer text
             for old, new in renumber_map.items():
                 answer = re.sub(rf"\[{old}\]", f"[{new}]", answer)
             logger.info(f"Renumbered {len(renumber_map)} citations in the answer")
 
-            # Step 6: Run fact check
+            # Step 6: (Optional) run fact check
             evaluation = self.fact_checker.evaluate_response(
                 query=query,
                 answer=answer,
@@ -1229,21 +1159,27 @@ class FlaskRAGAssistantV2:
                 deployment=self.deployment_name,
             )
             
-            # Step 7: Persist query + response + sources in the DB
+            # Step 7: Persist query + response + sources in your DB
             try:
+                # Get the SQL query used to retrieve the results (if available)
+                sql_query = None
+                # If you have access to the actual SQL query used, set it here
+                
+                # Log the query to the database
                 DatabaseManager.log_rag_query(
                     query=query,
                     response=answer,
                     sources=cited_sources,
                     context=context,
-                    sql_query=None
+                    sql_query=sql_query
                 )
                 logger.info("Logged RAG query to database")
             except Exception as log_exc:
                 logger.error(f"Error logging RAG query to database: {log_exc}")
-
+                # Continue even if logging fails
+            
             return answer, cited_sources, [], evaluation, context
-
+        
         except Exception as exc:
             logger.error(f"RAG generation error: {exc}", exc_info=True)
             return (
@@ -1358,16 +1294,19 @@ class FlaskRAGAssistantV2:
                 # Arguments for self.openai_client.chat.completions.create
                 'model': self.deployment_name,
                 'messages': messages,
-                'temperature': self.temperature,
-                'top_p': self.top_p,
+            }
+            if self.deployment_name == CHAT_DEPLOYMENT:
+                request['temperature'] = self.temperature
+                request['top_p'] = self.top_p
+            request.update({
                 'presence_penalty': self.presence_penalty,
                 'frequency_penalty': self.frequency_penalty,
                 'stream': True
-            }
+            })
             if self.deployment_name == CHAT_DEPLOYMENT_O4_MINI:
                 request['max_completion_tokens'] = self.max_completion_tokens
             else:
-                request['max_tokens'] = self.max_completion_tokens
+                request['max_completion_tokens'] = self.max_completion_tokens
             log_openai_call(request, {"type": "stream_started"})
             stream = self.openai_client.chat.completions.create(**request)
             
@@ -1828,8 +1767,7 @@ def run_phase3_tests():
     tests = [
         test_query_type_detection,
         test_prompt_selection,
-        test_history_summarization,
-        test_internal_citation_detection
+        test_history_summarization
     ]
     
     results = []

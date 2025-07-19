@@ -637,68 +637,68 @@ document.addEventListener('DOMContentLoaded', function() {
     .finally(() => {
       btn.disabled = false;
       btn.innerHTML = origIcon;
+// Updated magic button 2XL click handler with enhanced logging and undo functionality
+const magicBtn2xl = document.getElementById('magic-btn-2xl');
+if (magicBtn2xl) {
+  let originalPrompt = null;
+  magicBtn2xl.addEventListener('click', function() {
+    const input = document.getElementById('query-input');
+    const text = input.value.trim();
+    if (!text) return;
+
+    const btn = this;
+    const iconElement = btn.querySelector('i');
+    if (!iconElement) {
+      console.error('Icon element not found inside magicBtn2xl');
+      return;
+    }
+
+    console.log('Current icon classes before click:', iconElement.className);
+
+    // If currently showing undo icon, revert to original prompt
+    if (iconElement.classList.contains('fa-undo')) {
+      if (originalPrompt !== null) {
+        input.value = originalPrompt;
+        input.dataset.enhanced = 'false';
+        originalPrompt = null;
+        // Revert icon to wand
+        iconElement.className = 'fa-solid fa-wand-magic-sparkles';
+        console.log('Undo clicked: reverted to original prompt');
+        console.log('Icon classes after undo:', iconElement.className);
+      }
+      return;
+    }
+
+    // Store original prompt before enhancement
+    originalPrompt = text;
+
+    // Log the start of the process
+    console.log('Magic 2XL enhancement started');
+
+    // Disable button and show spinner icon
+    btn.disabled = true;
+    iconElement.className = 'fa-solid fa-spinner fa-spin';
+    console.log('Icon classes set to spinner:', iconElement.className);
+
+    
+
+    a
+    .catch(error => {
+      console.error('Network error during magic query 2XL:', error);
+      ChatHelpers.addBotMessage('Network error: ' + error.message);
+      // Revert icon and enable button on network error
+      iconElement.className = 'fa-solid fa-wand-magic-sparkles';
+      btn.disabled = false;
+      originalPrompt = null;
+      console.log('Icon classes reverted to wand on network error:', iconElement.className);
+    });
+  });
+}
+
     });
   });
 
-  // Magic button 2XL click handler
-  const magicBtn2xl = document.getElementById('magic-btn-2xl');
-  if (magicBtn2xl) {
-    magicBtn2xl.addEventListener('click', function() {
-      const text = document.getElementById('query-input').value.trim();
-      if (!text) return;
-      
-      // Store references to button and original icon to ensure they're accessible in all callbacks
-      const btn = this;
-      const origIcon = btn.innerHTML;
-      
-      // Log the start of the process
-      console.log('Magic 2XL enhancement started');
-      
-      // Disable button and show spinner
-      btn.disabled = true;
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
-      
-      fetch('/api/magic_query_2xl', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({input_text: text})
-      })
-      .then(res => {
-        console.log('Magic 2XL API response received');
-        return res.json();
-      })
-      .then(data => {
-        console.log('Magic 2XL API data processed');
-        if (data.error) {
-          console.error('Magic query 2XL error:', data.error);
-          ChatHelpers.addBotMessage('Error: ' + data.error);
-        } else {
-          const input = document.getElementById('query-input');
-          input.value = data.output;
-          // Store the enhanced flag as a data attribute on the input element
-          if (data.is_enhanced) {
-            input.dataset.enhanced = 'true';
-            console.log('Query enhanced with magic wand 2XL');
-          }
-        }
-      })
-      .catch(error => {
-        console.error('Network error during magic query 2XL:', error);
-        ChatHelpers.addBotMessage('Network error: ' + error.message);
-      })
-      .finally(() => { 
-        // Ensure button state is restored regardless of success or failure
-        console.log('Magic 2XL enhancement completed, restoring button state');
-        
-        // Use setTimeout to ensure this runs after all other callbacks
-        setTimeout(() => {
-          btn.disabled = false;
-          btn.innerHTML = origIcon;
-          console.log('Button state restored');
-        }, 0);
-      });
-    });
-  }
+  
 });
 
 // Also try to initialize after a short delay in case the DOM is already loaded

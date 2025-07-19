@@ -128,3 +128,5 @@ yarl==1.17.1
 opencensus-ext-azure
 opencensus-ext-flask
 opencensus-ext-requests
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.21.1
