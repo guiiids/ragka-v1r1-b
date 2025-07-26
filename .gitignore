@@ -26,3 +26,13 @@ Thumbs.db
 conversation_manager_copy.py
 .venv/
 # Ignore specific files that are not part of the project
+# Ignore heavy unnecessary files
+*.csv
+*.xlsx
+static/dev_eval_reports/
+
+# Ignore sensitive files
+secrets.json
+*.pem
+*.key
+config.py
