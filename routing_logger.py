@@ -54,7 +54,8 @@ class RoutingDecisionLogger:
         search_performed: bool,
         conversation_context: Optional[List[Dict]] = None,
         pattern_matches: Optional[Dict] = None,
-        processing_time_ms: Optional[float] = None
+        processing_time_ms: Optional[float] = None,
+        mediator_used: bool = False
     ) -> None:
         """
         Log a routing decision with detailed information.
@@ -95,7 +96,8 @@ class RoutingDecisionLogger:
             'search_performed': search_performed,
             'conversation_length': len(conversation_context) if conversation_context else 0,
             'pattern_matches': pattern_matches,
-            'processing_time_ms': processing_time_ms
+            'processing_time_ms': processing_time_ms,
+            'mediator_used': mediator_used
         }
         
         # Write to log file
@@ -127,6 +129,12 @@ class RoutingDecisionLogger:
             },
             'search_percentage': 0,
             'avg_processing_time': 0.0,
+            'mediator_usage': {
+                'total_uses': 0,
+                'success_rate': 0.0,
+                'avg_confidence_before': 0.0,
+                'avg_confidence_after': 0.0
+            },
             'potential_issues': []
         }
         
@@ -168,6 +176,15 @@ class RoutingDecisionLogger:
                     if entry.get('processing_time_ms'):
                         processing_times.append(entry['processing_time_ms'])
                     
+                    # Track mediator usage
+                    if entry.get('mediator_used'):
+                        analysis['mediator_usage']['total_uses'] += 1
+                        
+                        # If we have before/after confidence scores
+                        if entry.get('confidence_before') and entry.get('confidence'):
+                            analysis['mediator_usage']['avg_confidence_before'] += entry['confidence_before']
+                            analysis['mediator_usage']['avg_confidence_after'] += entry['confidence']
+                    
                     # Check for potential issues
                     self._check_for_issues(entry, analysis['potential_issues'])
         
@@ -181,11 +198,21 @@ class RoutingDecisionLogger:
             
             if processing_times:
                 analysis['avg_processing_time'] = sum(processing_times) / len(processing_times)
+            
+            # Calculate mediator statistics
+            mediator_uses = analysis['mediator_usage']['total_uses']
+            if mediator_uses > 0:
+                analysis['mediator_usage']['success_rate'] = (
+                    mediator_uses / analysis['total_decisions']
+                ) * 100
+                
+                analysis['mediator_usage']['avg_confidence_before'] /= mediator_uses
+                analysis['mediator_usage']['avg_confidence_after'] /= mediator_uses
         
         return analysis
     
     def _check_for_issues(self, entry: Dict, issues: List[Dict]) -> None:
-        """Check a log entry for potential issues."""
+        """Check a log entry for potential issues, including mediator-related concerns."""
         # Low confidence classification
         if entry['confidence'] < 0.6:
             issues.append({
@@ -213,6 +240,28 @@ class RoutingDecisionLogger:
                 'query': entry['query'],
                 'confidence': entry['confidence']
             })
+        
+        # Mediator-related issues
+        if entry.get('mediator_used'):
+            # Check if mediator significantly improved confidence
+            confidence_before = entry.get('confidence_before', 0)
+            confidence_after = entry.get('confidence', 0)
+            
+            if confidence_after <= confidence_before:
+                issues.append({
+                    'type': 'mediator_no_improvement',
+                    'query': entry['query'],
+                    'confidence_before': confidence_before,
+                    'confidence_after': confidence_after
+                })
+            
+            # Check for repeated mediator use on similar queries
+            if entry.get('conversation_length', 0) > 0:
+                issues.append({
+                    'type': 'mediator_in_conversation',
+                    'query': entry['query'],
+                    'conversation_length': entry['conversation_length']
+                })
     
     def get_summary_stats(self) -> Dict[str, Any]:
         """Get summary statistics for all logged decisions."""

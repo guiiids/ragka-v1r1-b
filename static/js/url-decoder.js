@@ -181,7 +181,7 @@
 
         // The SAS token to append to the URL
         // SECURITY WARNING: In a production environment, this should be generated dynamically by a secure backend
-        const SAS_TOKEN = "?sv=2024-11-04&ss=bfqt&srt=o&sp=rltfx&se=2025-07-31T15:04:58Z&st=2025-07-14T06:49:58Z&spr=https&sig=9y2bEV%2Bk915lPC1h6YrJLAB1XaC42NWty%2Bt986yMHwE%3D"
+        const SAS_TOKEN = "?sv=2024-11-04&ss=bfqt&srt=o&sp=rltfx&se=2025-07-31T15:04:58Z&st=2025-07-14T06:49:58Z&spr=https&sig=9y2bEV%2Bk915lPC1h6YrJLAB1XaC42NWty%2Bt986yMHwE%3D       "
         if (window.debugLogger) {
           window.debugLogger.log('Using SAS token', 'system', { SAS_TOKEN });
         }

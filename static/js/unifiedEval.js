@@ -757,13 +757,20 @@
                     link.addEventListener('click', function(e) {
                       e.preventDefault();
                       const sourceId = this.getAttribute('data-source-id');
-                      const sourceElement = document.getElementById(`source-${sourceId}`);
+                      // Try both the unique ID and display ID formats
+                      let sourceElement = document.getElementById(`source-${sourceId}`);
+                      if (!sourceElement) {
+                        // Fallback to looking for the element by display ID
+                        sourceElement = document.querySelector(`[data-source-id="${sourceId}"]`);
+                      }
                       if (sourceElement) {
                         sourceElement.scrollIntoView({ behavior: 'smooth' });
                         sourceElement.classList.add('bg-yellow-100');
                         setTimeout(() => {
                           sourceElement.classList.remove('bg-yellow-100');
                         }, 2000);
+                      } else {
+                        console.warn(`Source element not found for ID: ${sourceId}`);
                       }
                     });
                   });

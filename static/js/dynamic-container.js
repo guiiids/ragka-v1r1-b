@@ -274,11 +274,13 @@ class DynamicContainer {
 
   handleCitationClick(citationLink) {
     const sourceId = citationLink.getAttribute('data-source-id');
+    const messageId = citationLink.getAttribute('data-message-id');
     
     // Log the citation click if debug logger is available
     if (window.debugLogger) {
       window.debugLogger.log('Citation link clicked (dynamic mode)', 'user-action', {
         sourceId: sourceId,
+        messageId: messageId,
         linkText: citationLink.textContent,
         linkHref: citationLink.getAttribute('href')
       });
@@ -287,10 +289,32 @@ class DynamicContainer {
     // Remove any existing highlights
     this.removeAllHighlights();
     
-    // Get source information from the global lastSources
-    if (window.lastSources && Array.isArray(window.lastSources)) {
-      const sourceIndex = parseInt(sourceId) - 1;
-      const source = window.lastSources[sourceIndex];
+    // Try to get message-specific sources first, then fall back to global lastSources
+    let sourcesToUse = null;
+    
+    // Check if we have message-specific sources
+    if (messageId && window.messageSourcesMap && window.messageSourcesMap[messageId]) {
+      sourcesToUse = window.messageSourcesMap[messageId];
+      console.log(`Using message-specific sources for message ${messageId}:`, sourcesToUse);
+    } else if (window.lastSources && Array.isArray(window.lastSources)) {
+      sourcesToUse = window.lastSources;
+      console.log('Using global lastSources:', sourcesToUse);
+    }
+    
+    if (sourcesToUse && Array.isArray(sourcesToUse)) {
+      // Handle both numeric and unique ID citations
+      let source = null;
+      
+      // First try to find by exact ID match (for unique IDs)
+      source = sourcesToUse.find(s => s.id === sourceId);
+      
+      // If not found and sourceId is numeric, try index-based lookup
+      if (!source && /^\d+$/.test(sourceId)) {
+        const sourceIndex = parseInt(sourceId) - 1;
+        if (sourceIndex >= 0 && sourceIndex < sourcesToUse.length) {
+          source = sourcesToUse[sourceIndex];
+        }
+      }
       
       if (source) {
         let title = `Source [${sourceId}]`;

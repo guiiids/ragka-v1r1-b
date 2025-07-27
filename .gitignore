@@ -36,3 +36,8 @@ secrets.json
 *.pem
 *.key
 config.py
+
+# User requested ignores
+Profile
+main_O.py
+results.csv

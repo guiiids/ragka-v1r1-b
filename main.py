@@ -31,11 +31,13 @@ def get_sas_token():
 
 # Import the improved RAG implementation
 from rag_assistant_v2 import FlaskRAGAssistantV2
+from rag_cache_wrapper import RagCacheWrapper
 from db_manager import DatabaseManager
 from openai import AzureOpenAI
 from config import get_cost_rates
 from openai_service import OpenAIService
 from rag_improvement_logging import setup_improvement_logging
+from services.redis_service import redis_service
 
 # Set up dedicated logging for the improved implementation
 logger = setup_improvement_logging()
@@ -72,7 +74,17 @@ def get_rag_assistant(session_id):
     """Get or create a RAG assistant for the given session ID"""
     if session_id not in rag_assistants:
         logger.info(f"Creating new RAG assistant for session {session_id}")
-        rag_assistants[session_id] = FlaskRAGAssistantV2()
+        # Create a new RAG assistant instance
+        rag_assistant = FlaskRAGAssistantV2(session_id=session_id)
+        # Wrap it with the Redis cache wrapper
+        rag_assistants[session_id] = RagCacheWrapper(rag_assistant)
+        
+        # Log Redis connection status
+        if redis_service.is_connected():
+            logger.info(f"Redis cache enabled for session {session_id}")
+        else:
+            logger.warning(f"Redis cache not available for session {session_id}")
+    
     return rag_assistants[session_id]
 # LLM helpee helpers
 PROMPT_ENHANCER_SYSTEM_MESSAGE = QUERY_ENHANCER_SYSTEM_PROMPT = """
@@ -382,6 +394,56 @@ def api_query():
             "error": str(e)
         }), 500
 
+@app.route("/api/query/stream", methods=["POST"])
+def api_query_stream():
+    """Stream RAG responses for better perceived latency"""
+    data = request.get_json()
+    logger.debug(f"api_query_stream called with payload: {data}")
+    user_query = data.get("query", "")
+    is_enhanced = data.get("is_enhanced", False)
+    
+    # Get session and RAG assistant
+    session_id = session.get('session_id')
+    if not session_id:
+        session_id = os.urandom(16).hex()
+        session['session_id'] = session_id
+    
+    rag_assistant = get_rag_assistant(session_id)
+    
+    # Apply settings if provided
+    settings = data.get("settings", {})
+    if settings:
+        for key, value in settings.items():
+            if hasattr(rag_assistant, key):
+                setattr(rag_assistant, key, value)
+    
+    def generate():
+        try:
+            for chunk in rag_assistant.stream_rag_response(user_query):
+                if isinstance(chunk, str):
+                    # Text chunk
+                    yield f"data: {json.dumps({'type': 'content', 'data': chunk})}\n\n"
+                elif isinstance(chunk, dict):
+                    # Metadata (sources, evaluation, etc.)
+                    yield f"data: {json.dumps({'type': 'metadata', 'data': chunk})}\n\n"
+            
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'data': str(e)})}\n\n"
+    
+    return Response(
+        generate(),
+        mimetype='text/plain',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'  # Disable nginx buffering
+        }
+    )
+
+
 @app.route("/api/clear_history", methods=["POST"])
 def api_clear_history():
     """Clear the conversation history for the current session"""
@@ -390,6 +452,8 @@ def api_clear_history():
         if session_id and session_id in rag_assistants:
             logger.info(f"Clearing conversation history for session {session_id}")
             rag_assistants[session_id].clear_conversation_history()
+            # Also clear citation map from Redis for this session
+            redis_service.delete(f"citationmap:{session_id}")
             return jsonify({"success": True})
         else:
             logger.warning(f"No active session found to clear history")
@@ -399,14 +463,64 @@ def api_clear_history():
         logger.error(f"Traceback: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/api/cache/stats", methods=["GET"])
+def api_cache_stats():
+    """Get cache statistics"""
+    try:
+        session_id = session.get('session_id')
+        if session_id and session_id in rag_assistants:
+            logger.info(f"Getting cache stats for session {session_id}")
+            stats = rag_assistants[session_id].get_cache_stats()
+            return jsonify({"success": True, "stats": stats})
+        else:
+            # Return Redis connection status if no active session
+            connected = redis_service.is_connected()
+            health = redis_service.health_check() if connected else {}
+            return jsonify({
+                "success": True, 
+                "stats": {
+                    "connected": connected,
+                    "health": health,
+                    "message": "No active session found"
+                }
+            })
+    except Exception as e:
+        logger.error(f"Error getting cache stats: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/cache/clear", methods=["POST"])
+def api_clear_cache():
+    """Clear the cache for the current session"""
+    try:
+        session_id = session.get('session_id')
+        if session_id and session_id in rag_assistants:
+            logger.info(f"Clearing cache for session {session_id}")
+            # Get cache type from request if provided
+            data = request.get_json() or {}
+            cache_type = data.get("type")
+            
+            # Clear cache with optional type
+            success = rag_assistants[session_id].clear_cache(cache_type)
+            return jsonify({"success": success})
+        else:
+            logger.warning(f"No active session found to clear cache")
+            return jsonify({"success": True, "message": "No active session found"})
+    except Exception as e:
+        logger.error(f"Error clearing cache: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # Serve static files from the 'static' folder
 @app.route("/static/<path:filename>")
 def serve_static(filename):
+    logger.debug(f"serve_static called for static file: {filename}")
     return send_from_directory("static", filename)
 
 # Serve static files from the 'assets' folder
 @app.route("/assets/<path:filename>")
 def serve_assets(filename):
+    logger.debug(f"serve_assets called for asset file: {filename}")
     return send_from_directory("assets", filename)
 
 # Feedback submission endpoint

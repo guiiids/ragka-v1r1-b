@@ -12,6 +12,8 @@ import re
 import sys
 import os
 import json
+import time
+import hashlib
 from openai_logger import log_openai_call
 from db_manager import DatabaseManager
 from conversation_manager import ConversationManager
@@ -20,6 +22,7 @@ from rag_improvement_logging import get_phase_logger, get_checkpoint_logger, get
 from enhanced_pattern_matcher import EnhancedPatternMatcher
 from conversation_context_analyzer import ConversationContextAnalyzer
 from routing_logger import RoutingDecisionLogger
+from query_mediator import QueryMediator
 
 # Import config but handle the case where it might import streamlit
 try:
@@ -355,10 +358,104 @@ def test_internal_citation_detection():
     return False
 
 
+def generate_unique_source_id(content: str = "", timestamp: float = None) -> str:
+    """
+    Generate a unique, persistent ID for a source that remains stable across conversations.
+    
+    Args:
+        content: The source content to hash (optional)
+        timestamp: Optional timestamp, uses current time if not provided
+        
+    Returns:
+        A unique ID in format: S_{timestamp}_{hash}
+    """
+    if timestamp is None:
+        timestamp = int(time.time() * 1000)  # milliseconds for better uniqueness
+    
+    # Create a hash from content and timestamp for uniqueness
+    hash_input = f"{content}_{timestamp}".encode('utf-8')
+    content_hash = hashlib.md5(hash_input).hexdigest()[:8]  # First 8 chars for brevity
+    
+    unique_id = f"S_{timestamp}_{content_hash}"
+    logger.debug(f"Generated unique source ID: {unique_id}")
+    return unique_id
+
+
 class FlaskRAGAssistantV2:
     """Retrieval-Augmented Generation assistant that maintains conversation
     history, summarizes older turns when needed, and provides improved
     handling of procedural content."""
+
+    def _rebuild_citation_map(self, cited_sources):
+        """
+        Ensures self._display_ordered_citations and self._display_ordered_citation_map
+        are updated per request, not just at object init. Run after generating cited_sources.
+        
+        CRITICAL: This map must contain ALL sources from ALL messages for frontend lookup,
+        not just the current message's sources. The frontend expects to be able to look up
+        sources from previous messages when users click on old citations.
+        """
+        # Update only with current message's cited sources for display
+        self._display_ordered_citations = []
+        for source in cited_sources:
+            uid = source.get("id")
+            if uid:
+                self._display_ordered_citations.append(uid)
+        
+        # CRITICAL: Maintain ALL sources (current + previous) for lookup
+        # The frontend needs to be able to find sources from previous messages
+        for source in cited_sources:
+            uid = source.get("id")
+            if uid:
+                self._display_ordered_citation_map[uid] = source
+                
+        # Also ensure cumulative sources are accessible for lookup
+        for uid, source_info in self._cumulative_src_map.items():
+            if uid not in self._display_ordered_citation_map:
+                # Convert cumulative source format to citation format for frontend compatibility
+                self._display_ordered_citation_map[uid] = {
+                    "id": uid,
+                    "display_id": "1",  # Fallback display ID
+                    "title": source_info.get("title", ""),
+                    "content": source_info.get("content", ""),
+                    "parent_id": source_info.get("parent_id", ""),
+                    "is_procedural": source_info.get("is_procedural", False)
+                }
+
+    def _deduplicate_by_document(self, results: List[Dict]) -> List[Dict]:
+        """
+        Deduplicate results by (title, parent_id) while preserving order and selecting best chunk.
+        This prevents the citation mismatch issue by ensuring LLM only sees unique documents.
+        """
+        logger.info(f"Deduplicating {len(results)} results by document")
+        
+        seen_docs = {}  # (title, parent_id) -> best_result
+        
+        for result in results:
+            doc_key = (result.get("title", ""), result.get("parent_id", ""))
+            
+            if doc_key not in seen_docs:
+                # First chunk from this document
+                seen_docs[doc_key] = result
+                logger.debug(f"First chunk from document: {result.get('title', 'Untitled')}")
+            else:
+                # Additional chunk from same document - keep the one with higher relevance
+                existing = seen_docs[doc_key] 
+                if result.get("relevance", 0) > existing.get("relevance", 0):
+                    seen_docs[doc_key] = result
+                    logger.debug(f"Replaced chunk for document: {result.get('title', 'Untitled')} (better relevance)")
+        
+        # Return in original order, preserving the priority sequence
+        unique_results = []
+        seen_keys = set()
+        for result in results:
+            doc_key = (result.get("title", ""), result.get("parent_id", ""))
+            if doc_key not in seen_keys and seen_docs[doc_key] == result:
+                unique_results.append(result)
+                seen_keys.add(doc_key)
+        
+        logger.info(f"Deduplicated to {len(unique_results)} unique documents")
+        return unique_results
 
     # Default system prompt
     DEFAULT_SYSTEM_PROMPT = """
@@ -498,9 +595,21 @@ class FlaskRAGAssistantV2:
     """
 
     # ───────────────────────── setup ─────────────────────────
-    def __init__(self, settings=None) -> None:
+
+    def __init__(self, settings=None, session_id=None) -> None:
         self._init_cfg()
         
+        # Persistent session-global citation list and lookup:
+        self._display_ordered_citations = []  # Ordered list of unique source IDs, stable across session
+        self._display_ordered_citation_map = {}  # unique_id -> source info dict for fast lookup
+
+        # Message-scoped citation system
+        self._message_counter = 0
+        self._message_source_maps = {}  # message_id -> source_map
+        self._all_sources = {}  # uid -> source_info (for lookups)
+        # Store session id for Redis-backed persistence
+        self.session_id = session_id
+
         # Initialize the OpenAI service
         self.openai_service = OpenAIService(
             azure_endpoint=self.openai_endpoint,
@@ -513,6 +622,9 @@ class FlaskRAGAssistantV2:
         self.pattern_matcher = EnhancedPatternMatcher()
         self.context_analyzer = ConversationContextAnalyzer()
         self.routing_logger = RoutingDecisionLogger()
+        
+        # Initialize the query mediator with enhanced threshold for better entity detection
+        self.query_mediator = QueryMediator(self.openai_service, confidence_threshold=0.6)
         
         # Initialize the conversation manager with the system prompt
         self.conversation_manager = ConversationManager(self.DEFAULT_SYSTEM_PROMPT)
@@ -788,27 +900,34 @@ class FlaskRAGAssistantV2:
         prioritized_results = prioritize_procedural_content(results)
         logger.info(f"Results prioritized with procedural content first")
         
+        # CRITICAL FIX: Apply deduplication BEFORE LLM processing to prevent citation mismatches
+        unique_results = self._deduplicate_by_document(prioritized_results)
+        logger.info(f"After deduplication: {len(unique_results)} unique documents to show LLM")
+        
         entries, src_map = [], {}
-        sid = 1
         valid_chunks = 0
         
         # Track if we have procedural content
         has_procedural_content = False
         
-        # Process the top results (prioritized with procedural content first)
-        for res in prioritized_results[:5]:
+        # Process the unique results (now guaranteed to be unique documents)
+        for res in unique_results[:5]:
             chunk = res["chunk"].strip()
             if not chunk:
-                logger.warning(f"Empty chunk found in result {sid}, skipping")
+                logger.warning(f"Empty chunk found, skipping")
                 continue
 
             valid_chunks += 1
+            
+            # Generate unique ID for this source
+            unique_id = generate_unique_source_id(chunk)
+            logger.info(f"Generated unique ID {unique_id} for source")
             
             # Check if this is procedural content
             is_proc = is_procedural_content(chunk)
             if is_proc:
                 has_procedural_content = True
-                logger.info(f"Source {sid} contains procedural content")
+                logger.info(f"Source {unique_id} contains procedural content")
                 formatted_chunk = format_procedural_context(chunk)
             else:
                 formatted_chunk = format_context_text(chunk)
@@ -816,9 +935,9 @@ class FlaskRAGAssistantV2:
             # Log parent_id if available
             parent_id = res.get("parent_id", "")
             if parent_id:
-                logger.info(f"Source {sid} has parent_id: {parent_id[:30]}..." if len(parent_id) > 30 else parent_id)
+                logger.info(f"Source {unique_id} has parent_id: {parent_id[:30]}..." if len(parent_id) > 30 else parent_id)
             else:
-                logger.warning(f"Source {sid} missing parent_id")
+                logger.warning(f"Source {unique_id} missing parent_id")
 
             # Add metadata to the source entry
             metadata = res.get("metadata", {})
@@ -829,17 +948,17 @@ class FlaskRAGAssistantV2:
                 if "first_step" in metadata and "last_step" in metadata:
                     metadata_str += f" data-steps=\"{metadata['first_step']}-{metadata['last_step']}\""
             
-            # Include metadata in the source tag
-            entries.append(f'<source id="{sid}"{metadata_str}>{formatted_chunk}</source>')
+            # Include metadata in the source tag with unique ID
+            entries.append(f'<source id="{unique_id}"{metadata_str}>{formatted_chunk}</source>')
             
-            src_map[str(sid)] = {
+            src_map[unique_id] = {
                 "title": res["title"],
                 "content": formatted_chunk,
                 "parent_id": parent_id,  # Include parent_id in source map
                 "is_procedural": is_proc,  # Track if this is procedural content
-                "metadata": metadata  # Include full metadata
+                "metadata": metadata,  # Include full metadata
+                "unique_id": unique_id  # Store the unique ID  
             }
-            sid += 1
 
         context_str = "\n\n".join(entries)
         if valid_chunks == 0:
@@ -850,59 +969,72 @@ class FlaskRAGAssistantV2:
         logger.info(f"Context contains procedural content: {has_procedural_content}")
         # Save the last source map for summarization
         self._last_src_map = src_map
+
+        # DEBUG: Log the entire src_map for troubleshooting
+        import json
+        try:
+            pretty_src_map = json.dumps(
+                {k: {"title": v.get("title", ""), "parent_id": v.get("parent_id", ""), "is_procedural": v.get("is_procedural", False)} for k, v in src_map.items()},
+                indent=2
+            )
+            logger.info(f"DEBUG: Full src_map:\n{pretty_src_map}")
+        except Exception as e:
+            logger.error(f"Error logging src_map: {e}")
         
         return context_str, src_map
 
     def detect_query_type(self, query: str, conversation_history: List[Dict] = None) -> str:
         """
-        Detect the user's intent to route the query appropriately using enhanced pattern matching
-        and context analysis.
+        Detect the user's intent to route the query appropriately using enhanced pattern matching,
+        context analysis, and LLM-based mediation when needed.
         
         Args:
             query: The user query
             conversation_history: Optional conversation history for context
             
         Returns:
-            One of: "HISTORY_RECALL", "CONTEXTUAL_FOLLOW_UP", 
+            One of: "HISTORY_RECALL", "CONTEXTUAL_FOLLOW_UP", "CONTEXTUAL_WITH_SEARCH",
                    "NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"
         """
-        logger.info(f"Detecting query type for: '{query}'")
-        
-        # NEW: Start performance timing
-        import time
-        start_time = time.time()
+        logger.info(f"========== QUERY TYPE DETECTION ==========")
+        logger.info(f"Query: '{query}'")
         
         # Get pattern-based classification
         query_type, confidence = self.pattern_matcher.classify_query(query, conversation_history)
+        logger.info(f"Initial pattern-based classification: {query_type} (confidence: {confidence:.2f})")
         
-        # Get context-based analysis
-        context_scores = self.context_analyzer.analyze_context(query, conversation_history)
+        # Use the mediator to refine the classification, especially for complex cases
+        mediator_result = self.query_mediator.classify(
+            query=query,
+            history=conversation_history,
+            current_classification={query_type: confidence}
+        )
         
-        # NEW: Calculate performance metrics
-        response_time_ms = (time.time() - start_time) * 1000
+        logger.info(f"Mediator result: {mediator_result}")
         
-        # Log the decision for analysis
+        # If the mediator provided a definitive classification, use it
+        if mediator_result.get('source') == 'mediator':
+            final_classification = mediator_result['classification']
+            final_confidence = mediator_result.get('confidence', 0.8) # Default to high confidence for mediator
+            logger.info(f"Using mediator classification: {final_classification} (confidence: {final_confidence:.2f})")
+        else:
+            final_classification = query_type
+            final_confidence = confidence
+            logger.info(f"Using pattern-based classification: {final_classification} (confidence: {final_confidence:.2f})")
+            
+        # Log the final decision
         self.routing_logger.log_decision(
             query=query,
-            detected_type=query_type,
-            confidence=confidence,
-            search_performed=query_type.startswith("NEW_TOPIC"),
+            detected_type=final_classification,
+            confidence=final_confidence,
+            search_performed=final_classification in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL", "CONTEXTUAL_WITH_SEARCH"],
             conversation_context=conversation_history,
-            pattern_matches=self.pattern_matcher.get_confidence_explanation(query, query_type, confidence),
-            processing_time_ms=response_time_ms
+            pattern_matches=mediator_result.get('reasoning', self.pattern_matcher.get_confidence_explanation(query, final_classification, final_confidence)),
+            mediator_used=mediator_result.get('source') == 'mediator'
         )
         
-        # NEW: Log performance metrics
-        self.routing_logger.log_performance_metrics(
-            query=query,
-            classification_method='regex',  # Will be dynamic in Phase 1B
-            response_time_ms=response_time_ms,
-            confidence=confidence,
-            cache_key=f"intent:{hash(query)}:{len(conversation_history) if conversation_history else 0}"
-        )
-        
-        logger.info(f"Query '{query}' detected as {query_type} with confidence {confidence:.2f}")
-        return query_type
+        logger.info(f"========== FINAL CLASSIFICATION: {final_classification} ==========")
+        return final_classification
 
     def _chat_answer_with_history(self, query: str, context: str, src_map: Dict) -> str:
         """Generate a response using the conversation history"""
@@ -960,6 +1092,7 @@ class FlaskRAGAssistantV2:
         payload = {
             "model": self.deployment_name,
             "messages": messages,
+            "store": True,
 
           
         }
@@ -994,12 +1127,35 @@ class FlaskRAGAssistantV2:
         
         # First, check for explicit citations in the format [id]
         explicit_citations = set()
-        citation_pattern = r'\[(\d+)\]'
-        for match in re.finditer(citation_pattern, answer):
+        
+        # Pattern for numeric citations [1], [2], etc. Map to src_map entries by index
+        numeric_citation_pattern = r'\[(\d+)\]'
+        numeric_matches = [m.group(1) for m in re.finditer(numeric_citation_pattern, answer)]
+        keys = list(src_map.keys())
+        for num in numeric_matches:
+            try:
+                idx = int(num) - 1
+                if 0 <= idx < len(keys):
+                    uid = keys[idx]
+                    explicit_citations.add(uid)
+                    logger.info(f"Mapped numeric citation [{num}] to source {uid}")
+                else:
+                    logger.warning(f"Numeric citation [{num}] out of range for src_map keys")
+            except ValueError:
+                logger.warning(f"Invalid numeric citation marker [{num}]")
+        
+        # Pattern for unique ID citations [S_timestamp_hash]
+        unique_citation_pattern = r'\[(S_\d+_[a-zA-Z0-9]+)\]'
+        for match in re.finditer(unique_citation_pattern, answer):
             sid = match.group(1)
             if sid in src_map:
                 explicit_citations.add(sid)
-                logger.info(f"Source {sid} is explicitly cited in the answer")
+                logger.info(f"Source {sid} is explicitly cited in the answer (unique ID)")
+                
+        # Debug logging to help diagnose citation issues
+        logger.info(f"Answer text: {answer}")
+        logger.info(f"Source map keys: {list(src_map.keys())}")
+        logger.info(f"Explicit citations found: {explicit_citations}")
         
         # Add explicitly cited sources
         for sid in explicit_citations:
@@ -1059,19 +1215,98 @@ class FlaskRAGAssistantV2:
         logger.info(f"Found {len(cited_sources)} cited sources (explicit and implicit)")
         return cited_sources
 
+    def _assemble_cited_sources(self, answer: str, src_map: Dict[str, Any]) -> Tuple[List[Dict], Dict[str, str]]:
+        """
+        Per-message citation logic - only sources from THIS message's search results.
+        Each message gets completely independent citation numbering starting from [1].
+        """
+        logger.info("--- Assembling Cited Sources (Message-Only) ---")
+        
+        # CRITICAL CHANGE: Only use sources from the current message (src_map), 
+        # NOT from the cumulative map. This prevents citation mixing between messages.
+        
+        # Filter to only sources actually cited in this message's answer
+        cited_sources = self._filter_cited(answer, src_map)
+        
+        # CRITICAL FIX: If no cited sources but we have a src_map (from search results),
+        # ALWAYS create fallback sources for the sidebar AND citation map accessibility
+        # This fixes the first message timing issue where sources appear but aren't clickable
+        if not cited_sources and src_map:
+            logger.warning("No cited sources found in answer; providing fallback source list from current search results for sidebar.")
+            cited_sources = []
+            for uid, src in list(src_map.items())[:5]:
+                cited_sources.append({
+                    "id": uid,
+                    "title": src.get("title", ""),
+                    "content": src.get("content", ""),
+                    "parent_id": src.get("parent_id", ""),
+                    "is_procedural": src.get("is_procedural", False)
+                })
+        
+        # Deduplicate cited sources by document (title, parent_id)
+        seen_docs = {}  # Maps doc_key to best_source
+        unique_cited = []
+        
+        for source in cited_sources:
+            doc_key = (source.get("title", ""), source.get("parent_id", ""))
+            
+            if doc_key not in seen_docs:
+                seen_docs[doc_key] = source
+                unique_cited.append(source)
+                logger.info(f"New cited document: {source.get('title', 'Untitled')}")
+            else:
+                # Keep the source with higher relevance if available
+                existing = seen_docs[doc_key]
+                if source.get("relevance", 0) > existing.get("relevance", 0):
+                    # Replace in the list
+                    idx = unique_cited.index(existing)
+                    unique_cited[idx] = source
+                    seen_docs[doc_key] = source
+                    logger.info(f"Replaced cited document: {source.get('title', 'Untitled')} (better relevance)")
+        
+        # Create per-message citation numbering starting from 1
+        # IMPORTANT: This ensures each message has independent [1], [2], [3] etc.
+        message_sources = []
+        renumber_map = {}
+        
+        for i, source in enumerate(unique_cited, 1):
+            display_id = str(i)
+            unique_id = source["id"]
+            
+            message_sources.append({
+                "id": unique_id,
+                "display_id": display_id,
+                "title": source.get("title", ""),
+                "content": source.get("content", ""),
+                "parent_id": source.get("parent_id", ""),
+                "is_procedural": source.get("is_procedural", False),
+                **({"url": source["url"]} if "url" in source else {})
+            })
+            
+            # Map unique ID to display ID for this message
+            renumber_map[unique_id] = display_id
+            
+            logger.info(f"Message citation [{display_id}] -> {source.get('title', 'Untitled')}")
+
+        logger.info(f"Final per-message renumber_map: {renumber_map}")
+        logger.info(f"Final message_sources count: {len(message_sources)}")
+        logger.info("--- End Assembling Cited Sources ---")
+
+        return message_sources, renumber_map
+
     # ─────────── public API ───────────────
     def generate_rag_response(
         self, query: str, is_enhanced: bool = False
     ) -> Tuple[str, List[Dict], List[Dict], Dict[str, Any], str]:
         """
-        Generate a response using the intelligent RAG router.
+        Generate a response using the intelligent RAG router, with per-message citation flagging.
         
         Args:
             query: The user query
             is_enhanced: A flag to indicate if the query is already enhanced
             
         Returns:
-            answer, cited_sources, [], evaluation, context
+            answer, all_cited_sources_with_flag, [], evaluation, context
         """
         try:
             logger.info(f"========== STARTING RAG RESPONSE WITH INTELLIGENT ROUTING ==========")
@@ -1086,22 +1321,29 @@ class FlaskRAGAssistantV2:
             src_map = {}
             
             # Step 2: Execute action based on intent
-            if query_type in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"]:
-                logger.info(f"Handling '{query_type}'. Performing a fresh knowledge base search.")
+            if query_type in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL", "CONTEXTUAL_WITH_SEARCH"]:
+                logger.info(f"Handling '{query_type}'. Performing knowledge base search.")
                 kb_results = self.search_knowledge_base(query)
                 if not kb_results:
-                    return (
-                        "No relevant information found in the knowledge base.",
-                        [],
-                        [],
-                        {},
-                        "",
-                    )
-                context, src_map = self._prepare_context(kb_results)
-                # Update cumulative source map for future reference
-                self._cumulative_src_map.update(src_map)
-                logger.info(f"Updated cumulative source map, now contains {len(self._cumulative_src_map)} sources")
-            
+                    # For contextual search, it's okay to have no new results, just use history
+                    if query_type == "CONTEXTUAL_WITH_SEARCH":
+                        logger.warning("No new documents found for contextual search, proceeding with history.")
+                        context = "[No new context provided for this turn. Answer based on the conversation history.]"
+                        src_map = self._cumulative_src_map
+                    else:
+                        return (
+                            "No relevant information found in the knowledge base.",
+                            [],
+                            [],
+                            {},
+                            "",
+                        )
+                else:
+                    context, src_map = self._prepare_context(kb_results)
+                    # Update cumulative source map for future reference
+                    self._cumulative_src_map.update(src_map)
+                    logger.info(f"Updated cumulative source map, now contains {len(self._cumulative_src_map)} sources")
+
             elif query_type in ["CONTEXTUAL_FOLLOW_UP", "HISTORY_RECALL"]:
                 logger.info(f"Handling '{query_type}'. Skipping search and using conversation history.")
                 # No new context is needed. The model will use the chat history.
@@ -1126,30 +1368,92 @@ class FlaskRAGAssistantV2:
             answer = self._chat_answer_with_history(query, context, src_map)
             logger.info(f"Generated answer of length {len(answer)}")
 
-            # Step 4: Filter citations across all seen sources
-            cited_raw = self._filter_cited(answer, self._cumulative_src_map)
+            # Step 4: CRITICAL FIX - Only use sources from THIS message's search results
+            # This prevents citations from mixing between different messages
+            cited_sources, renumber_map = self._assemble_cited_sources(answer, src_map)
 
-            # Step 5: Renumber citations in order of appearance
-            renumber_map = {}
-            cited_sources = []
-            for new_id, src in enumerate(cited_raw, 1):
-                old_id = src["id"]
-                renumber_map[old_id] = str(new_id)
-                entry = {
-                    "id": str(new_id), 
-                    "title": src["title"], 
-                    "content": src["content"],
-                    "parent_id": src.get("parent_id", ""),  # Include parent_id in cited sources
-                    "is_procedural": src.get("is_procedural", False)
-                }
-                if "url" in src:
-                    entry["url"] = src["url"]
-                cited_sources.append(entry)
+            # --- CORRECT RENUMBERRING IN-TEXT CITATIONS TO DISPLAY IDs ---
+            # Build a mapping from all citation references in the answer ([N], [unique_id]) to the corresponding display ID.
 
-            # Apply new numbering to the answer text
-            for old, new in renumber_map.items():
-                answer = re.sub(rf"\[{old}\]", f"[{new}]", answer)
-            logger.info(f"Renumbered {len(renumber_map)} citations in the answer")
+            def renumber_citations(answer, cited_sources, renumber_map):
+                # Step 1: Build an index of which original in-text markers correspond to which unique_id
+                # We want: for every [N] or [S_...], map it to the unique id and thus to display id
+
+                # Build a reverse index for numeric mapping: for answer [1], [2], etc.
+                unique_ids = [src["id"] for src in cited_sources]
+                display_ids = [src["display_id"] for src in cited_sources]
+                # Build a mapping of possible numeric citation in LLM (1-based) to unique id used
+                numeric_to_uid = {}
+                for idx, uid in enumerate(unique_ids):
+                    numeric_to_uid[str(idx + 1)] = uid  # [1] => unique_ids[0], etc.
+
+                # Build a mapping of all to display_id for substitution
+                # [S_...] => [display_id], [n] => [display_id] if matched
+                def citation_replacer(match):
+                    marker = match.group(1)
+                    # Unique id style ([S_xxx_xxx])
+                    if marker in renumber_map:
+                        return f'[{renumber_map[marker]}]'
+                    # Numeric style ([n]). Only map if the number corresponds to a cited source found in mapping
+                    elif marker in numeric_to_uid and numeric_to_uid[marker] in renumber_map:
+                        return f'[{renumber_map[numeric_to_uid[marker]]}]'
+                    # Otherwise, leave as is (do not replace unrelated/unrecognized numbers)
+                    return match.group(0)
+                # Replace all [n] or [S_...] with correct display_id
+                answer = re.sub(r'\[([A-Za-z0-9_]+)\]', citation_replacer, answer)
+                return answer
+
+            answer = renumber_citations(answer, cited_sources, renumber_map)
+
+            # [NEW] Always rebuild citation map so UI always has correct state every request
+            self._rebuild_citation_map(cited_sources)
+
+            # Validate: check that all citations in answer ([N]) are present in cited_sources
+            cited_display_ids = {c["display_id"] for c in cited_sources}
+            missing_cits = set(re.findall(r'\[(\d+)\]', answer)) - cited_display_ids
+            if missing_cits:
+                logger.warning(f"Some citation numbers in answer have no corresponding source object: {missing_cits}")
+
+            # ------ NEW: Ensure all unique id markers in the model answer are sources ------
+            unique_id_cits = set(re.findall(r'\[([a-z0-9]{8,})\]', answer))
+            cited_unique_ids = {c["id"] for c in cited_sources}
+            missing_unique = unique_id_cits - cited_unique_ids
+            for missing_uid in missing_unique:
+                # Defensive: Add a placeholder entry if not found, so UI popup works (shows Not Available)
+                logger.warning(f"Citation in answer uses ID not present in cited_sources: {missing_uid}")
+                cited_sources.append({
+                    "id": missing_uid,
+                    "display_id": "-",
+                    "title": "[Source not available]",
+                    "content": "",
+                    "parent_id": "",
+                    "is_procedural": False
+                })
+            # ------ END NEW ------
+
+            # DEBUG: Log first few lines of each cited source content
+            for src in cited_sources:
+                content_preview = "\n".join(src["content"].splitlines()[:3])
+                truncated_title = src['title'] if len(src['title']) <= 40 else src['title'][:37] + "..."
+                logger.info(f"Source {src['id']} <{truncated_title}> contains procedural content")
+                logger.info(f"Citation ID: {src['id']}, Title: {src['title']}\nContent preview:\n{content_preview}\n---")
+
+            logger.info(f"Processed {len(cited_sources)} cited sources (no renumbering applied, original IDs kept)")
+            if cited_sources:
+                logger.info(f"Example - Unique ID: {cited_sources[0]['id']}, Display ID: {cited_sources[0]['display_id']}")
+
+            # --- NEW: Provide ALL citations with active flag ---
+            # Current cited sources are the "active" (latest message) ones
+            current_ids = set(src["id"] for src in cited_sources)
+            all_citation_objs = []
+            # Make a union of all prior sources (from self._display_ordered_citation_map) + current ones
+            all_source_ids = set(self._display_ordered_citation_map.keys())
+            for uid in all_source_ids:
+                src = self._display_ordered_citation_map[uid]
+                item = dict(src)  # Copy to avoid mutating internals
+                # Add the activity flag:
+                item["is_current_message"] = uid in current_ids
+                all_citation_objs.append(item)
 
             # Step 6: (Optional) run fact check
             evaluation = self.fact_checker.evaluate_response(
@@ -1169,7 +1473,7 @@ class FlaskRAGAssistantV2:
                 DatabaseManager.log_rag_query(
                     query=query,
                     response=answer,
-                    sources=cited_sources,
+                    sources=all_citation_objs,
                     context=context,
                     sql_query=sql_query
                 )
@@ -1178,7 +1482,8 @@ class FlaskRAGAssistantV2:
                 logger.error(f"Error logging RAG query to database: {log_exc}")
                 # Continue even if logging fails
             
-            return answer, cited_sources, [], evaluation, context
+            # Return all citations w/ activity status for UI to decide link vs disabled-link
+            return answer, all_citation_objs, [], evaluation, context
         
         except Exception as exc:
             logger.error(f"RAG generation error: {exc}", exc_info=True)
@@ -1213,15 +1518,19 @@ class FlaskRAGAssistantV2:
             src_map = {}
             
             # Step 2: Execute action based on intent
-            if query_type in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL"]:
-                logger.info(f"Handling '{query_type}'. Performing a fresh knowledge base search.")
+            if query_type in ["NEW_TOPIC_PROCEDURAL", "NEW_TOPIC_INFORMATIONAL", "CONTEXTUAL_WITH_SEARCH"]:
+                logger.info(f"Handling '{query_type}'. Performing knowledge base search.")
                 kb_results = self.search_knowledge_base(query)
                 if kb_results:
                     context, src_map = self._prepare_context(kb_results)
                     # Update cumulative source map for future reference
                     self._cumulative_src_map.update(src_map)
                     logger.info(f"Updated cumulative source map, now contains {len(self._cumulative_src_map)} sources")
-            
+                elif query_type == "CONTEXTUAL_WITH_SEARCH":
+                    logger.warning("No new documents found for contextual search, proceeding with history.")
+                    context = "[No new context provided for this turn. Answer based on the conversation history.]"
+                    src_map = self._cumulative_src_map
+
             elif query_type in ["CONTEXTUAL_FOLLOW_UP", "HISTORY_RECALL"]:
                 logger.info(f"Handling '{query_type}'. Skipping search and using conversation history.")
                 # No new context is needed. The model will use the chat history.
@@ -1293,6 +1602,7 @@ class FlaskRAGAssistantV2:
             request = {
                 # Arguments for self.openai_client.chat.completions.create
                 'model': self.deployment_name,
+                'store': True,
                 'messages': messages,
             }
             if self.deployment_name == CHAT_DEPLOYMENT:
@@ -1323,29 +1633,55 @@ class FlaskRAGAssistantV2:
             # Add the assistant's response to conversation history
             self.conversation_manager.add_assistant_message(collected_answer)
             
-            # Filter cited sources from all seen sources
-            cited_raw = self._filter_cited(collected_answer, self._cumulative_src_map)
+            # CRITICAL FIX - Use only THIS message's sources for citation assembly
+            # This prevents citations from mixing between different messages
+            cited_sources, renumber_map = self._assemble_cited_sources(collected_answer, src_map)
+
+            # CRITICAL FIX: If no cited sources but we have a src_map (from search results),
+            # ALWAYS create fallback sources for the sidebar AND citation map accessibility
+            # This fixes the first message timing issue where sources appear but aren't clickable
+            if not cited_sources and src_map:
+                logger.warning("No cited sources found in answer; providing fallback source list from current search results for sidebar.")
+                cited_sources = []
+                display_num = 1
+                for uid, src in list(src_map.items())[:5]:
+                    cited_sources.append({
+                        "id": uid,
+                        "display_id": str(display_num),
+                        "title": src.get("title", ""),
+                        "content": src.get("content", ""),
+                        "parent_id": src.get("parent_id", ""),
+                        "is_procedural": src.get("is_procedural", False)
+                    })
+                    display_num += 1
+            # Additional fallback: If still no cited sources but we have cumulative sources
+            elif not cited_sources and self._cumulative_src_map:
+                logger.warning("No cited sources found; providing fallback from cumulative sources.")
+                cited_sources = []
+                seen_keys = set()
+                display_num = 1
+                for uid, src in list(self._cumulative_src_map.items())[:5]:
+                    doc_key = (src.get("title", ""), src.get("parent_id", ""))
+                    if doc_key in seen_keys:
+                        continue
+                    seen_keys.add(doc_key)
+                    cited_sources.append({
+                        "id": uid,
+                        "display_id": str(display_num),
+                        "title": src.get("title", ""),
+                        "content": src.get("content", ""),
+                        "parent_id": src.get("parent_id", ""),
+                        "is_procedural": src.get("is_procedural", False)
+                    })
+                    display_num += 1
+
+            # CRITICAL: Always rebuild citation map with cited sources to ensure accessibility
+            self._rebuild_citation_map(cited_sources)
             
-            # Renumber in cited order: 1, 2, 3…
-            renumber_map = {}
-            cited_sources = []
-            for new_id, src in enumerate(cited_raw, 1):
-                old_id = src["id"]
-                renumber_map[old_id] = str(new_id)
-                entry = {
-                    "id": str(new_id), 
-                    "title": src["title"], 
-                    "content": src["content"],
-                    "parent_id": src.get("parent_id", ""),  # Include parent_id in cited sources
-                    "is_procedural": src.get("is_procedural", False)
-                }
-                if "url" in src:
-                    entry["url"] = src["url"]
-                cited_sources.append(entry)
-            
-            # Apply renumbering to the answer
-            for old, new in renumber_map.items():
-                collected_answer = re.sub(rf"\[{old}\]", f"[{new}]", collected_answer)
+            # DO NOT remap unique citation IDs to display numbering; keep as original IDs.
+            logger.info(f"Processed {len(cited_sources)} cited sources (no renumbering applied, original IDs kept)")
+            if cited_sources:
+                logger.info(f"Example - Unique ID: {cited_sources[0]['id']}, Display ID: {cited_sources[0]['display_id']}")
             
             # Get evaluation
             evaluation = self.fact_checker.evaluate_response(

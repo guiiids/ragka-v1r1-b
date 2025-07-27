@@ -308,20 +308,22 @@
         <!-- Feedback Data Table Section -->
         <div class="bg-white dark:bg-black text-white shadow-md rounded-xl overflow-hidden mb-8 fade-in">
             <div class="p-6 border-b border-gray-200">
-                <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
                     <div>
                         <h2 class="text-2xl font-bold text-gray-800">All Feedback</h2>
                         <p class="text-sm text-gray-500">Total: <span id="total-count">124</span> entries</p>
                     </div>
-                    <div class="w-full md:w-auto">
+                    <div class="flex flex-col sm:flex-row items-center space-x-4 w-full sm:w-auto">
                         <div class="relative">
-                            <div class="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none">
-                                <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
-                                </svg>
-                            </div>
-                            <input type="text" id="search-input" placeholder="Search feedback..." class="w-full md:w-64 pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
+                            <svg class="w-4 h-4 text-gray-500 absolute left-3 top-1/2 transform -translate-y-1/2 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                            </svg>
+                            <input type="text" id="search-input" placeholder="Search feedback..." class="w-full sm:w-64 pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
                         </div>
+                        <div class="relative">
+                            <input type="text" id="date-range" placeholder="mm/dd/yyyy - mm/dd/yyyy" class="w-full sm:w-64 pl-4 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
+                        </div>
+                        <button id="download-btn" class="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition duration-200">Download XLS/CSV</button>
                     </div>
                 </div>
             </div>
@@ -2869,27 +2871,71 @@ By following these steps and leveraging available resources, users can efficient
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/wordcloud@1.2.2/src/wordcloud2.js"></script>
     <script>
-        // Search functionality
+        // Search and filter functionality
         document.addEventListener('DOMContentLoaded', function() {
             const searchInput = document.getElementById('search-input');
-            const tableRows = document.querySelectorAll('#feedback-table-body tr');
-            
-            searchInput.addEventListener('keyup', function() {
-                const searchTerm = this.value.toLowerCase();
-                
+            const dateInput = document.getElementById('date-range');
+            const downloadBtn = document.getElementById('download-btn');
+            const tableRows = Array.from(document.querySelectorAll('#feedback-table-body tr'));
+            const table = document.getElementById('feedback-table-body').closest('table');
+
+            function filterRows() {
+                const searchTerm = searchInput.value.toLowerCase();
+                let dateStart = null, dateEnd = null;
+                const dateValue = dateInput.value;
+                if (dateValue.includes('-')) {
+                    const parts = dateValue.split('-').map(s => s.trim());
+                    if (parts.length === 2) {
+                        dateStart = new Date(parts[0]);
+                        dateEnd = new Date(parts[1]);
+                    }
+                }
+                let visibleCount = 0;
                 tableRows.forEach(row => {
                     const text = row.textContent.toLowerCase();
-                    if(text.includes(searchTerm)) {
+                    const timestampText = row.querySelector('td').textContent.trim();
+                    let showBySearch = text.includes(searchTerm);
+                    let showByDate = true;
+                    if (dateStart && dateEnd) {
+                        const rowDate = new Date(timestampText);
+                        showByDate = rowDate >= dateStart && rowDate <= dateEnd;
+                    }
+                    if (showBySearch && showByDate) {
                         row.style.display = '';
+                        visibleCount++;
                     } else {
                         row.style.display = 'none';
                     }
                 });
-                
-                // Update count of visible rows
-                const visibleRows = document.querySelectorAll('#feedback-table-body tr[style=""]').length;
-                document.getElementById('total-count').textContent = visibleRows;
+                document.getElementById('total-count').textContent = visibleCount;
+            }
+
+            searchInput.addEventListener('keyup', filterRows);
+            dateInput.addEventListener('change', filterRows);
+
+            downloadBtn.addEventListener('click', function() {
+                const headers = Array.from(table.querySelectorAll('thead th')).map(th => `"${th.textContent.trim()}"`);
+                const rowsData = [];
+                tableRows.forEach(row => {
+                    if (row.style.display !== 'none') {
+                        const cells = Array.from(row.querySelectorAll('td')).map(td => `"${td.textContent.replace(/"/g,'""').trim()}"`);
+                        rowsData.push(cells.join(','));
+                    }
+                });
+                let csvContent = headers.join(',') + '\n' + rowsData.join('\n');
+                const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'feedback.csv';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
             });
+
+            // Initialize with all rows visible
+            filterRows();
         });
       
         // Requests per hour chart

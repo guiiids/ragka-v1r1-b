@@ -8,7 +8,7 @@ import http from 'k6/http';
 import { check } from 'k6';
 
 export let options = {
-  vus: 10,           // virtual users (concurrent requests)
+  vus: 20,           // virtual users (concurrent requests)
   duration: '1m',    // total test time
 };
 
@@ -17,7 +17,7 @@ export default function () {
   const port = __ENV.TARGET_PORT || '5001';
   const url = `http://${host}:${port}/api/query`;
   const payload = JSON.stringify({
-    query: 'Hello, world!'
+    query: 'Troubleshoot Agilent GC.'
   });
   const params = {
     headers: {

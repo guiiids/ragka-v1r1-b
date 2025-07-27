@@ -60,18 +60,64 @@ const ChatHelpers = {
   },
   
   // Format message with markdown rendering
-  formatMessage: function(text) {
+  formatMessage: function(text, sources = null, messageId = null) {
     if (typeof window.formatMessage === 'function') {
       return window.formatMessage(text);
     } else {
       try {
         // Try to use marked.js if available
         if (typeof marked !== 'undefined') {
+          // Generate a unique message ID if not provided
+          const msgId = messageId || `msg_${Date.now()}`;
+          
           // Pre-process special cases before passing to marked.js
-          let processedText = text.replace(
-            /\[(\d+)\]/g,
-            '<a href="#source-$1" class="citation-link text-xs text-blue-600 hover:underline" data-source-id="$1">[$1]</a>'
-          );
+          // Handle both numeric citations [n] and internal IDs [S_xxxxx]
+            let processedText = text.replace(
+              /\[([^\]]+)\]/g,
+              function(match, citationContent) {
+                // Use provided sources or fallback to window.lastSources
+                const sourcesToUse = sources || window.lastSources;
+                if (!sourcesToUse) return match;
+
+                // Check if it's a simple numeric citation [1], [2], etc.
+                if (/^\d+$/.test(citationContent)) {
+                  const displayId = citationContent;
+                  
+                  // Always (re)build these each time for robust dev
+                  let id2display = {}, display2id = {};
+                  sourcesToUse.forEach(src => {
+                    if (src.id) id2display[src.id] = src.display_id;
+                    if (src.display_id) display2id[src.display_id] = src.id;
+                  });
+
+                  // Find the source with this display_id to get its unique ID
+                  let uniqueId = displayId; // fallback
+                  if (display2id[displayId]) {
+                    uniqueId = display2id[displayId];
+                  }
+
+                  // Match the main application's citation format with message-specific source data
+                  return `<sup class="text-2xl"><a href="#source-${uniqueId}" class="citation-link text-xs text-blue-600" data-source-id="${uniqueId}" data-message-id="${msgId}">[${displayId}]</a></sup>`;
+                }
+                
+                // Check if it's an internal source ID [S_xxxxx]
+                if (citationContent.startsWith('S_')) {
+                  const sourceId = citationContent;
+                  // Find the source with this ID to get its display_id
+                  let displayId = '1'; // fallback
+                  const sourceIndex = sourcesToUse.findIndex(s => s.id === sourceId);
+                  if (sourceIndex !== -1) {
+                    displayId = sourcesToUse[sourceIndex].display_id || (sourceIndex + 1).toString();
+                  }
+
+                  // Match the main application's citation format with message-specific source data
+                  return `<sup class="text-2xl"><a href="#source-${sourceId}" class="citation-link text-xs text-blue-600" data-source-id="${sourceId}" data-message-id="${msgId}">[${displayId}]</a></sup>`;
+                }
+                
+                // For any other format, return as-is
+                return match;
+              }
+            );
           
           return marked.parse(processedText, {
             gfm: true,
@@ -421,23 +467,41 @@ const DevEvalChat = {
         return;
       }
       
+      // Create a unique ID for this message/response
+      const messageId = `msg_${Date.now()}`;
+      
+      // Store sources in a message-specific object
+      if (!window.messageSourcesMap) {
+        window.messageSourcesMap = {};
+      }
+      window.messageSourcesMap[messageId] = [...data.sources]; // Clone the array
+      
       // Show LLM result (the actual answer to the query)
-      ChatHelpers.addBotMessage('<strong>LLM Output:</strong><br>' + ChatHelpers.formatMessage(data.result));
+      // Display the LLM output with formatted citations
+      ChatHelpers.addBotMessage('<strong>LLM Output:</strong><br>' + ChatHelpers.formatMessage(data.result, data.sources, messageId));
       
       // Show sources if available
         if (data.sources && data.sources.length > 0) {
-          let sourcesText = '<strong>Sources:</strong><br><div class="sources-container">';
+          // DEBUG: Log sources returned by backend
+          console.log("[DEBUG] sources array returned from backend:", data.sources);
+          
+          // Store sources in a message-specific data attribute
+          window.lastSources = data.sources; // Keep for backward compatibility
+          
+          console.log(`[DEBUG] Sources stored for message ${messageId}:`, window.messageSourcesMap[messageId]);
+          
+          let sourcesText = `<strong>Sources:</strong><br><div class="sources-container" data-message-id="${messageId}">`;
           data.sources.forEach((source, index) => {
-            // Create a unique ID for each source for citation linking
-            const sourceId = `source-${index + 1}`;
-            
-            // Start source item with ID for citation links
-            sourcesText += `<div id="${sourceId}" class="source-item mb-2 p-2 bg-gray-50 rounded">`;
-            
+            // Use unique id for anchor/lookup, display_id for user (legacy/robust logic)
+            const anchorId = source.id;
+            const displayId = source.display_id || (index + 1).toString();
+
+            // Start source item with unique id for citation links
+            sourcesText += `<div id="source-${anchorId}" class="source-item mb-2 p-2 bg-gray-50 rounded">`;
             // Handle different source formats
             let sourceTitle = '';
             let sourceContent = '';
-            
+
             if (typeof source === 'string') {
               // For string sources, use the first 100 chars as title and the rest as content
               if (source.length > 100) {
@@ -449,28 +513,28 @@ const DevEvalChat = {
               }
             } else if (typeof source === 'object') {
               // Extract title and content from source object
-              sourceTitle = source.title || source.id || `Source ${index + 1}`;
+              sourceTitle = source.title || source.id || `Source ${displayId}`;
               sourceContent = source.content || '';
             }
-            
+
             // Truncate content if it's too long (more than 150 chars)
             const isLongContent = sourceContent.length > 150;
-            const truncatedContent = isLongContent ? 
-              sourceContent.substring(0, 150) + '...' : 
+            const truncatedContent = isLongContent ?
+              sourceContent.substring(0, 150) + '...' :
               sourceContent;
-            
+
             // Create HTML with collapsible content
             sourcesText += `
               <div>
-                <strong>[${index + 1}]</strong> <strong>${sourceTitle}</strong>
+                <strong>[${displayId}]</strong> <strong>${sourceTitle}</strong>
                 <div class="source-content">${truncatedContent}</div>
-                ${isLongContent ? 
+                ${isLongContent ?
                   `<div class="source-full-content hidden">${sourceContent}</div>
-                   <button class="toggle-source-btn text-blue-600 text-xs mt-1 hover:underline">Show more</button>` 
+                   <button class="toggle-source-btn text-blue-600 text-xs mt-1 hover:underline">Show more</button>`
                   : ''}
               </div>
             `;
-            
+
             sourcesText += '</div>';
           });
           sourcesText += '</div>';
@@ -479,18 +543,44 @@ const DevEvalChat = {
           
           // Add click event for citation links and toggle buttons
           setTimeout(() => {
-            // Handle citation links
+            // Add click event for citation links
             document.querySelectorAll('.citation-link').forEach(link => {
               link.addEventListener('click', function(e) {
                 e.preventDefault();
                 const sourceId = this.getAttribute('data-source-id');
-                const sourceElement = document.getElementById(`source-${sourceId}`);
-                if (sourceElement) {
-                  sourceElement.scrollIntoView({ behavior: 'smooth' });
-                  sourceElement.classList.add('bg-yellow-100');
-                  setTimeout(() => {
-                    sourceElement.classList.remove('bg-yellow-100');
-                  }, 2000);
+                const messageId = this.getAttribute('data-message-id');
+                
+                // Find the closest message container to get the message ID if not in the link
+                if (!messageId) {
+                  const messageContainer = this.closest('.message-content');
+                  if (messageContainer) {
+                    const sourcesContainer = messageContainer.querySelector('.sources-container');
+                    if (sourcesContainer) {
+                      messageId = sourcesContainer.getAttribute('data-message-id');
+                    }
+                  }
+                }
+                
+                // Find the source by unique ID using the message-specific sources if available
+                let source = null;
+                
+                // Try to find the source in the message-specific sources map
+                if (messageId && window.messageSourcesMap && window.messageSourcesMap[messageId]) {
+                  source = window.messageSourcesMap[messageId].find(s => s.id === sourceId);
+                  console.log(`Looking for source ${sourceId} in message ${messageId}:`, source);
+                  
+                  // Update global lastSources to use the message-specific sources
+                  // This ensures the main application's handleCitationClick will find the correct source
+                  window.lastSources = window.messageSourcesMap[messageId];
+                }
+                
+                // Use the main application's citation handler if available
+                if (typeof window.handleCitationClick === 'function') {
+                  window.handleCitationClick(sourceId);
+                } else {
+                  console.error('handleCitationClick function not available in global scope');
+                  // Fallback to just logging the source
+                  console.log('Citation clicked:', sourceId, source);
                 }
               });
             });
@@ -680,9 +770,30 @@ if (magicBtn2xl) {
     iconElement.className = 'fa-solid fa-spinner fa-spin';
     console.log('Icon classes set to spinner:', iconElement.className);
 
-    
-
-    a
+    // Call the API
+    fetch('/api/magic_query_2xl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input_text: text })
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.error) {
+        console.error('Magic query 2XL error:', data.error);
+        ChatHelpers.addBotMessage('Error: ' + data.error);
+        // Revert icon and enable button
+        iconElement.className = 'fa-solid fa-wand-magic-sparkles';
+        btn.disabled = false;
+      } else {
+        input.value = data.output || text;
+        // Store the enhanced flag as a data attribute
+        input.dataset.enhanced = 'true';
+        console.log('Query enhanced with magic wand 2XL');
+        // Change icon to undo button
+        iconElement.className = 'fa-solid fa-undo';
+        btn.disabled = false;
+      }
+    })
     .catch(error => {
       console.error('Network error during magic query 2XL:', error);
       ChatHelpers.addBotMessage('Network error: ' + error.message);
@@ -708,6 +819,8 @@ setTimeout(function() {
     DevEvalChat.init();
   }
 }, 1000);
+
+// No replacement - removing the showSourcePopup function entirely
 
 // Add a global function to manually toggle eVal mode
 // This can be called from the console for debugging

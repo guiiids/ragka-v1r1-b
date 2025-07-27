@@ -8,7 +8,7 @@ ENHANCED_PATTERNS: Dict[str, Dict[str, List[str]]] = {
     'NEW_TOPIC_PROCEDURAL': {
         'strong_indicators': [
             r'^how to\b',
-            r'^how (do|can|would|should) (i|we|you)\b',
+            r'^how (do|can|would|should) (i|we|you) (?!.*(it|this|that|them)\b)',
             r'^what (are|is) the steps\b',
             r'^(guide|walk) me through\b',
             r'^show me how to\b',
@@ -42,7 +42,10 @@ ENHANCED_PATTERNS: Dict[str, Dict[str, List[str]]] = {
             r'^what (else|more)\b',
             r'^(that|this|it)\b',
             r'^why\b(?!.*(is|are|do|does))',
+            # FIXED: Allow "how do/can/would/should" when followed by pronouns or contextual references
             r'^how\b(?!.*(to|do|can|would|should))',
+            r'^how (do|can|would|should) (i|we|you) (use|access|get|find) (it|this|that|them)\b',
+            r'^how (do|can|would|should) (i|we|you) .*(it|this|that|them)\b',
             # NEW: Common follow-up phrases
             r'^(then what|what next|after that)\b',
             r'^(go on|continue|keep going)\b',

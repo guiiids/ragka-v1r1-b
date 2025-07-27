@@ -69,6 +69,11 @@
             if (feedbackSubmissions.has(messageId)) return;
             
             const container = document.querySelector(`[data-message-id="${messageId}"]`);
+            
+            // Reset any previous selection
+            resetFeedbackState(container);
+            
+            // Set thumbs up as selected
             container.querySelector('[data-type="up"]').style.color = '#22c55e';
             container.querySelector('[data-type="down"]').style.color = '#6b7280';
             container.querySelector('.feedback-details').style.display = 'none';
@@ -80,6 +85,11 @@
             if (feedbackSubmissions.has(messageId)) return;
             
             const container = document.querySelector(`[data-message-id="${messageId}"]`);
+            
+            // Reset any previous selection
+            resetFeedbackState(container);
+            
+            // Set thumbs down as selected
             container.querySelector('[data-type="down"]').style.color = '#ef4444';
             container.querySelector('[data-type="up"]').style.color = '#6b7280';
             container.querySelector('.feedback-details').style.display = 'block';
@@ -87,6 +97,27 @@
             container.querySelector('.comment-container').style.display = 'none'; 
             container.querySelector('.feedback-submit-btn').style.display = 'none';
             container.dataset.selectedType = 'negative';
+        }
+        
+        function resetFeedbackState(container) {
+            // Reset all checkboxes
+            container.querySelectorAll('.feedback-reason').forEach(cb => {
+                cb.checked = false;
+            });
+            
+            // Clear comment
+            const commentBox = container.querySelector('.feedback-comment');
+            if (commentBox) {
+                commentBox.value = '';
+            }
+            
+            // Hide details and submit button
+            container.querySelector('.feedback-details').style.display = 'none';
+            container.querySelector('.comment-container').style.display = 'none';
+            container.querySelector('.feedback-submit-btn').style.display = 'none';
+            
+            // Reset selected type
+            delete container.dataset.selectedType;
         }
         
         function handleSubmit(messageId) {
@@ -209,12 +240,48 @@
                         'processing evaluation','running developer evaluation'];
             if (skip.some(s => text.includes(s))) return;
             
+            // Look for streaming messages that don't have the "Was this helpful?" span
+            // but should get feedback buttons
+            const isStreamingMessage = last.classList.contains('streaming-message') || 
+                                      last.querySelector('.streaming-content');
+            
+            if (isStreamingMessage) {
+                // Add feedback directly to streaming messages
+                addFeedbackToStreamingMessage(last);
+                return;
+            }
+            
+            // Original logic for non-streaming messages
             const span = [...last.querySelectorAll('span')].find(s => s.textContent.includes('Was this helpful?'));
             if (!span) return;
             
             const msgId = generateMessageId();
             span.insertAdjacentHTML('afterend', createFeedbackHTML(msgId));
             setupListeners(msgId, last);
+        }
+        
+        function addFeedbackToStreamingMessage(messageElement) {
+            const msgId = generateMessageId();
+            
+            // Find the appropriate container to add feedback
+            const messageContainer = messageElement.querySelector('.flex.flex-col');
+            if (messageContainer) {
+                // Look for existing "Was this helpful?" span
+                let helpfulSpan = [...messageContainer.querySelectorAll('span')].find(s => 
+                    s.textContent.includes('Was this helpful?'));
+                
+                // If no span exists, create one
+                if (!helpfulSpan) {
+                    helpfulSpan = document.createElement('span');
+                    helpfulSpan.className = 'text-xs font-normal text-gray-500 dark:text-white/60 text-right pt-33';
+                    helpfulSpan.textContent = 'Was this helpful?';
+                    messageContainer.appendChild(helpfulSpan);
+                }
+                
+                // Add feedback HTML
+                helpfulSpan.insertAdjacentHTML('afterend', createFeedbackHTML(msgId));
+                setupListeners(msgId, messageElement);
+            }
         }
         
         function setupListeners(messageId, parent) {
@@ -239,12 +306,22 @@
             // hover
             ['up','down'].forEach(type => {
                 const el = container.querySelector(`[data-type="${type}"]`);
-                const color = type==='up' ? '#22c55e' : '#ef4444';
+                const hoverColor = type==='up' ? '#22c55e' : '#ef4444';
+                const selectedColor = type==='up' ? '#22c55e' : '#ef4444';
+                
                 el.addEventListener('mouseenter', () => {
-                    if (container.dataset.selectedType!==type) el.style.color = color;
+                    if (container.dataset.selectedType !== type) {
+                        el.style.color = hoverColor;
+                    }
                 });
                 el.addEventListener('mouseleave', () => {
-                    if (container.dataset.selectedType!==type) el.style.color = '#6b7280';
+                    if (container.dataset.selectedType === type) {
+                        // Keep selected color if this is the selected type
+                        el.style.color = selectedColor;
+                    } else {
+                        // Return to gray if not selected
+                        el.style.color = '#6b7280';
+                    }
                 });
             });
         }
@@ -265,8 +342,13 @@
             initializeFeedbackSystem();
         }
         
+        // Make key functions globally accessible
+        window.addFeedbackToLastMessage = addFeedbackToLastMessage;
+        
         window.FeedbackSystem = {
             config: FEEDBACK_CONFIG,
-            feedbackSubmissions
+            feedbackSubmissions,
+            addFeedbackToLastMessage: addFeedbackToLastMessage,
+            addFeedbackToStreamingMessage: addFeedbackToStreamingMessage
         };
     })();
